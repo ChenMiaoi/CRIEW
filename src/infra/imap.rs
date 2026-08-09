@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use flate2::read::GzDecoder;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rustls::pki_types::ServerName;
@@ -21,6 +22,7 @@ use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::infra::config::{ImapConfig, ImapEncryption};
 use crate::infra::error::{CriewError, ErrorCode, Result};
+use crate::infra::mail_parser::parse_headers;
 
 const LORE_BASE_URL: &str = "https://lore.kernel.org";
 const GNU_ARCHIVE_MBOX_BASE_URL: &str = "https://lists.gnu.org/archive/mbox";
@@ -30,6 +32,7 @@ const HTTP_PROXY_RESPONSE_MAX_BYTES: usize = 8 * 1024;
 const IMAP_FETCH_BATCH_SIZE: usize = 100;
 const GNU_ARCHIVE_INITIAL_MONTH_LIMIT: usize = 2;
 const GNU_ARCHIVE_UID_STRIDE: u32 = 1_000_000;
+const MAX_THREAD_DISCOVERY_IDS: usize = 512;
 
 #[cfg(test)]
 trait TestTransportIo: Read + Write + Send {}
@@ -85,6 +88,24 @@ pub trait ImapClient {
         let mut mails = self.fetch_incremental(mailbox, 0, None)?;
         mails.retain(|mail| wanted.contains(&mail.uid));
         Ok(mails)
+    }
+
+    /// Fetch all locally visible messages belonging to the requested thread.
+    ///
+    /// Source adapters with a native thread endpoint or server-side search
+    /// should override this method. The fallback is intentionally bounded by
+    /// the source's normal incremental view so fixture and archive adapters
+    /// remain useful without duplicating their storage logic.
+    fn fetch_thread(&mut self, mailbox: &str, message_id: &str) -> Result<Vec<RemoteMail>> {
+        let messages = self.fetch_incremental(mailbox, 0, None)?;
+        let messages = retain_thread_messages(messages, message_id);
+        if messages.is_empty() {
+            return Err(imap_error(
+                ImapErrorKind::Protocol,
+                format!("thread containing Message-ID '{message_id}' was not found"),
+            ));
+        }
+        Ok(messages)
     }
 }
 
@@ -413,6 +434,67 @@ impl LoreImapClient {
             Ok((status_code, bytes.to_vec()))
         })
     }
+
+    fn thread_url_candidates(&self, mailbox: &str, message_id: &str) -> Vec<String> {
+        let message_id = normalize_requested_message_id(message_id);
+        let mailbox = mailbox.trim_matches('/');
+        let base_url = self.base_url.trim_end_matches('/');
+        let message_id = encode_lore_path_segment(&message_id);
+        let mailbox = encode_lore_path_segment(mailbox);
+
+        [
+            format!("{base_url}/{mailbox}/{message_id}/t.mbox.gz"),
+            format!("{base_url}/r/{message_id}/t.mbox.gz"),
+        ]
+        .into_iter()
+        .filter(|candidate| reqwest::Url::parse(candidate).is_ok())
+        .collect()
+    }
+
+    fn fetch_thread_mbox(&self, mailbox: &str, message_id: &str) -> Result<Vec<u8>> {
+        let mut last_error: Option<CriewError> = None;
+        for url in self.thread_url_candidates(mailbox, message_id) {
+            let response = match self.client.get(&url).send() {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(CriewError::with_source(
+                        ErrorCode::Imap,
+                        format!("failed to fetch lore thread {url}"),
+                        error,
+                    ));
+                    continue;
+                }
+            };
+            let status_code = response.status().as_u16();
+            let bytes = match response.bytes() {
+                Ok(bytes) => bytes.to_vec(),
+                Err(error) => {
+                    last_error = Some(CriewError::with_source(
+                        ErrorCode::Imap,
+                        format!("failed to read lore thread body {url}"),
+                        error,
+                    ));
+                    continue;
+                }
+            };
+            if !(200..300).contains(&status_code) {
+                last_error = Some(imap_error(
+                    ImapErrorKind::Protocol,
+                    format!("failed to fetch lore thread {url}: HTTP {status_code}"),
+                ));
+                continue;
+            }
+
+            return decode_gzip_payload(&bytes, &url);
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            imap_error(
+                ImapErrorKind::Protocol,
+                format!("failed to resolve lore thread for Message-ID '{message_id}'"),
+            )
+        }))
+    }
 }
 
 fn parse_lore_feed_response(url: &str, status_code: u16, body: &str) -> Result<Vec<LoreFeedEntry>> {
@@ -523,6 +605,30 @@ impl ImapClient for LoreImapClient {
         build_lore_incremental_mails(entries, since_modseq, |message_url| {
             self.fetch_raw_mail(message_url)
         })
+    }
+
+    fn fetch_thread(&mut self, mailbox: &str, message_id: &str) -> Result<Vec<RemoteMail>> {
+        self.ensure_connected()?;
+        let raw_mbox = self.fetch_thread_mbox(mailbox, message_id)?;
+        let messages = parse_gnu_archive_mbox_messages(&raw_mbox);
+        let mut remote = Vec::with_capacity(messages.len());
+        for raw in messages {
+            remote.push(RemoteMail {
+                uid: 0,
+                modseq: None,
+                flags: Vec::new(),
+                raw,
+            });
+        }
+
+        let filtered = retain_thread_messages(remote, message_id);
+        if filtered.is_empty() {
+            return Err(imap_error(
+                ImapErrorKind::Protocol,
+                format!("lore thread did not contain Message-ID '{message_id}'"),
+            ));
+        }
+        Ok(filtered)
     }
 }
 
@@ -793,6 +899,62 @@ impl ImapClient for RemoteImapClient {
         let session = self.session_mut()?;
         let _ = session.select_mailbox(mailbox)?;
         session.fetch_uids(uids, "BODY.PEEK[]")
+    }
+
+    fn fetch_thread(&mut self, mailbox: &str, message_id: &str) -> Result<Vec<RemoteMail>> {
+        let session = self.session_mut()?;
+        let _ = session.select_mailbox(mailbox)?;
+
+        let mut pending_ids = vec![normalize_requested_message_id(message_id)];
+        let mut seen_ids = HashSet::new();
+        let mut discovered_uids = BTreeSet::new();
+        let mut fetched_by_uid = std::collections::HashMap::new();
+
+        while let Some(current_id) = pending_ids.pop() {
+            if seen_ids.len() >= MAX_THREAD_DISCOVERY_IDS {
+                tracing::warn!(
+                    mailbox = %mailbox,
+                    message_id = %message_id,
+                    limit = MAX_THREAD_DISCOVERY_IDS,
+                    "stopping IMAP thread discovery at the reference limit"
+                );
+                break;
+            }
+            if !seen_ids.insert(current_id.clone()) {
+                continue;
+            }
+
+            let mut matching_uids = session.search_header("MESSAGE-ID", &current_id)?;
+            matching_uids.extend(session.search_header("IN-REPLY-TO", &current_id)?);
+            let new_uids: Vec<u32> = matching_uids
+                .into_iter()
+                .filter(|uid| discovered_uids.insert(*uid))
+                .collect();
+            if new_uids.is_empty() {
+                continue;
+            }
+
+            for mail in session.fetch_uids(&new_uids, "BODY.PEEK[]")? {
+                let fallback = format!("synthetic-imap-{}@local", mail.uid);
+                let parsed = parse_headers(&mail.raw, fallback);
+                pending_ids.extend(parsed.references);
+                if let Some(reply_to) = parsed.in_reply_to {
+                    pending_ids.push(reply_to);
+                }
+                fetched_by_uid.insert(mail.uid, mail);
+            }
+        }
+
+        if fetched_by_uid.is_empty() {
+            return Err(imap_error(
+                ImapErrorKind::Protocol,
+                format!("thread containing Message-ID '{message_id}' was not found"),
+            ));
+        }
+
+        let mut fetched: Vec<RemoteMail> = fetched_by_uid.into_values().collect();
+        fetched.sort_by_key(|mail| mail.uid);
+        Ok(fetched)
     }
 }
 
@@ -1082,6 +1244,13 @@ impl ImapSession {
 
     fn search_modseq(&mut self, modseq: u64) -> Result<Vec<u32>> {
         self.search_uids(&format!("UID SEARCH MODSEQ {modseq}"))
+    }
+
+    fn search_header(&mut self, header: &str, value: &str) -> Result<Vec<u32>> {
+        self.search_uids(&format!(
+            "UID SEARCH HEADER {header} {}",
+            quote_imap_string(&format!("<{value}>"))
+        ))
     }
 
     fn search_uids(&mut self, command: &str) -> Result<Vec<u32>> {
@@ -2206,6 +2375,46 @@ fn normalize_lore_message_url(value: &str) -> Option<String> {
     }
 }
 
+fn normalize_requested_message_id(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string()
+}
+
+fn encode_lore_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+fn decode_gzip_payload(bytes: &[u8], url: &str) -> Result<Vec<u8>> {
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Ok(bytes.to_vec());
+    }
+
+    let mut decoder = GzDecoder::new(bytes);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Imap,
+            format!("failed to decompress lore thread {url}"),
+            error,
+        )
+    })?;
+    Ok(decoded)
+}
+
 fn lore_raw_url_candidates(message_url: &str) -> Vec<String> {
     let normalized =
         normalize_lore_message_url(message_url).unwrap_or_else(|| message_url.to_string());
@@ -2226,6 +2435,69 @@ fn lore_raw_url_candidates(message_url: &str) -> Vec<String> {
     }
 
     uniq
+}
+
+fn retain_thread_messages(messages: Vec<RemoteMail>, message_id: &str) -> Vec<RemoteMail> {
+    let target = normalize_requested_message_id(message_id);
+    if target.is_empty() {
+        return Vec::new();
+    }
+
+    let parsed: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, mail)| {
+            let fallback = format!("synthetic-thread-{index}@local");
+            (index, parse_headers(&mail.raw, fallback))
+        })
+        .collect();
+    let known_ids: HashSet<String> = parsed
+        .iter()
+        .map(|(_, headers)| headers.message_id.clone())
+        .collect();
+    if !known_ids.contains(&target) {
+        return Vec::new();
+    }
+
+    let mut adjacency: std::collections::HashMap<String, HashSet<String>> =
+        std::collections::HashMap::new();
+    for (_, headers) in &parsed {
+        let mut references = headers.references.clone();
+        if let Some(reply_to) = headers.in_reply_to.as_ref() {
+            references.push(reply_to.clone());
+        }
+        for reference in references {
+            if !known_ids.contains(&reference) {
+                continue;
+            }
+            adjacency
+                .entry(headers.message_id.clone())
+                .or_default()
+                .insert(reference.clone());
+            adjacency
+                .entry(reference)
+                .or_default()
+                .insert(headers.message_id.clone());
+        }
+    }
+
+    let mut component = HashSet::from([target]);
+    let mut queue: Vec<String> = component.iter().cloned().collect();
+    while let Some(current) = queue.pop() {
+        for neighbor in adjacency.get(&current).into_iter().flatten() {
+            if component.insert(neighbor.clone()) {
+                queue.push(neighbor.clone());
+            }
+        }
+    }
+
+    let mut selected: Vec<RemoteMail> = messages
+        .into_iter()
+        .zip(parsed)
+        .filter_map(|(mail, (_, headers))| component.contains(&headers.message_id).then_some(mail))
+        .collect();
+    selected.sort_by_key(|mail| mail.uid);
+    selected
 }
 
 fn imap_error(kind: ImapErrorKind, message: impl Into<String>) -> CriewError {
@@ -2255,19 +2527,23 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::infra::config::{ImapConfig, ImapEncryption};
+    use crate::infra::mail_parser::parse_headers;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     use super::{
         FixtureImapClient, GnuArchiveClient, GnuArchiveMonthEntry, GreetingKind, ImapClient,
-        ImapErrorKind, ImapSession, LoreImapClient, MailboxSnapshot, RemoteImapClient,
+        ImapErrorKind, ImapSession, LoreImapClient, MailboxSnapshot, RemoteImapClient, RemoteMail,
         build_gnu_archive_incremental_mails, build_lore_incremental_mails,
-        collect_incremental_uids, ensure_tagged_ok, establish_http_connect_tunnel,
-        establish_socks5_tunnel, fetch_lore_raw_with, format_uid_sequence_set,
-        gnu_archive_message_uid, lore_raw_url_candidates, normalize_lore_message_url,
-        parse_atom_timestamp, parse_fetch_flags, parse_fetch_modseq, parse_fetch_uid, parse_flags,
-        parse_gnu_archive_index_response, parse_gnu_archive_listing_timestamp,
-        parse_gnu_archive_mbox_messages, parse_gnu_archive_month_entries, parse_imap_proxy,
-        parse_literal_len, parse_lore_atom_entries, parse_lore_feed_response,
-        parse_status_code_u64, parse_year_month_key, quote_imap_string, read_http_proxy_response,
+        collect_incremental_uids, decode_gzip_payload, ensure_tagged_ok,
+        establish_http_connect_tunnel, establish_socks5_tunnel, fetch_lore_raw_with,
+        format_uid_sequence_set, gnu_archive_message_uid, lore_raw_url_candidates,
+        normalize_lore_message_url, parse_atom_timestamp, parse_fetch_flags, parse_fetch_modseq,
+        parse_fetch_uid, parse_flags, parse_gnu_archive_index_response,
+        parse_gnu_archive_listing_timestamp, parse_gnu_archive_mbox_messages,
+        parse_gnu_archive_month_entries, parse_imap_proxy, parse_literal_len,
+        parse_lore_atom_entries, parse_lore_feed_response, parse_status_code_u64,
+        parse_year_month_key, quote_imap_string, read_http_proxy_response, retain_thread_messages,
         select_gnu_archive_months, validate_gnu_archive_mbox_response,
     };
 
@@ -2538,6 +2814,90 @@ mod tests {
         assert!(second_batch.is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fixture_client_fetches_complete_connected_thread() {
+        let root = temp_dir("thread-fetch");
+        fs::write(
+            root.join("1-root.eml"),
+            "Message-ID: <root@example.com>\nSubject: [PATCH] root\n\nroot\n",
+        )
+        .expect("write root");
+        fs::write(
+            root.join("2-reply.eml"),
+            "Message-ID: <reply@example.com>\nIn-Reply-To: <root@example.com>\nReferences: <root@example.com>\nSubject: Re: [PATCH] root\n\nreply\n",
+        )
+        .expect("write reply");
+        fs::write(
+            root.join("3-nested.eml"),
+            "Message-ID: <nested@example.com>\nIn-Reply-To: <reply@example.com>\nReferences: <root@example.com> <reply@example.com>\nSubject: Re: [PATCH] root\n\nnested\n",
+        )
+        .expect("write nested reply");
+        fs::write(
+            root.join("4-unrelated.eml"),
+            "Message-ID: <other@example.com>\nSubject: unrelated\n\nother\n",
+        )
+        .expect("write unrelated");
+
+        let mut client = FixtureImapClient::new(root.clone(), 1);
+        client.connect().expect("connect fixture");
+        let fetched = client
+            .fetch_thread("inbox", "<reply@example.com>")
+            .expect("fetch complete thread");
+        let ids: Vec<String> = fetched
+            .iter()
+            .map(|mail| parse_headers(&mail.raw, "fallback@example.com".to_string()).message_id)
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                "root@example.com",
+                "reply@example.com",
+                "nested@example.com"
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lore_thread_url_candidates_encode_message_id_and_support_routing() {
+        let client = LoreImapClient::new(Some("https://lore.example")).expect("create client");
+        assert_eq!(
+            client.thread_url_candidates("io-uring", "<abc@example.com>"),
+            vec![
+                "https://lore.example/io-uring/abc%40example.com/t.mbox.gz",
+                "https://lore.example/r/abc%40example.com/t.mbox.gz"
+            ]
+        );
+    }
+
+    #[test]
+    fn gzip_thread_payload_is_decoded_before_mbox_parsing() {
+        let raw =
+            b"From sender Tue Mar 03 04:39:31 2026\nMessage-ID: <thread@example.com>\n\nbody\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw).expect("write gzip payload");
+        let compressed = encoder.finish().expect("finish gzip payload");
+
+        let decoded = decode_gzip_payload(&compressed, "https://lore.example/thread")
+            .expect("decode gzip payload");
+        assert_eq!(decoded, raw);
+        assert_eq!(parse_gnu_archive_mbox_messages(&decoded).len(), 1);
+    }
+
+    #[test]
+    fn thread_filter_rejects_missing_target_message_id() {
+        let messages = vec![RemoteMail {
+            uid: 1,
+            modseq: None,
+            flags: Vec::new(),
+            raw: b"Message-ID: <present@example.com>\n\nbody\n".to_vec(),
+        }];
+
+        assert!(retain_thread_messages(messages, "missing@example.com").is_empty());
     }
 
     #[test]

@@ -192,6 +192,18 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         {
             state.run_patch_action(patch_worker::PatchAction::Download);
         }
+        KeyCode::Char('F')
+            if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Threads) =>
+        {
+            if let Some(message_id) = state
+                .selected_thread()
+                .map(|thread| thread.message_id.clone())
+            {
+                state.start_thread_fetch(message_id);
+            } else {
+                state.status = "select a thread before fetching its complete thread".to_string();
+            }
+        }
         KeyCode::Char(character)
             if matches!(state.ui_page, UiPage::Mail)
                 && matches!(state.focus, Pane::Threads)
@@ -618,13 +630,17 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "restart" => return LoopAction::Restart,
                 "help" => {
                     state.status = format!(
-                        "commands: quit, exit, restart, help, sync [mailbox], config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
+                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, F fetch thread, u undo apply, e reply/inline edit, r reply, E external vim",
                         main_page_focus_shortcuts(&state.main_page_keymap),
                         main_page_move_shortcuts(&state.main_page_keymap)
                     );
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
                     run_palette_sync(state, value);
+                    state.dismiss_palette();
+                }
+                value if value.split_whitespace().next() == Some("fetch-thread") => {
+                    state.queue_palette_thread_fetch(&raw_command);
                     state.dismiss_palette();
                 }
                 value if value.split_whitespace().next() == Some("config") => {

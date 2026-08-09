@@ -333,7 +333,7 @@ MVP 范围与阶段目标已迁移至独立文档：
 ### 14.1 已决策项
 
 - 工程结构采用四层模块：`app` / `domain` / `infra` / `ui`。
-- CLI 命令固定为：`tui`、`sync`、`doctor`、`version`。
+- CLI 命令固定为：`tui`、`sync`、`fetch-thread`、`doctor`、`version`。
 - 配置读取采用 TOML，支持 `--config` 路径覆盖和默认目录策略。
 - 启动阶段统一执行目录引导与 SQLite 初始化迁移，`schema_version` 作为版本入口。
 - b4 检查顺序固定：配置路径 -> `CRIEW_B4_PATH` -> `vendor/b4/b4.sh` -> `PATH` 中 `b4`。
@@ -473,6 +473,26 @@ MVP 范围与阶段目标已迁移至独立文档：
   需补草稿存储与恢复策略。
 - MVP 仍依赖外部 `git send-email` 与用户本地 git mail 配置；后续在不改变 Reply Panel
   交互的前提下，可替换为 CRIEW 自实现 SMTP 发送器。
+
+## 20. M9（已完成）：按 Message-ID 按需补齐完整 thread
+
+### 20.1 已决策项
+
+- 新增 `fetch-thread` CLI 命令，按 mailbox 与目标 `Message-ID` 拉取完整对话，复用现有
+  解析、JWZ thread 重建、SQLite 幂等写入和 checkpoint 事务路径。
+- Lore/public-inbox 源优先请求 `t.mbox.gz` thread endpoint；真实 IMAP 源递归执行
+  `HEADER MESSAGE-ID` / `HEADER IN-REPLY-TO` 搜索，并沿 `References` 与
+  `In-Reply-To` 继续发现关联消息。
+- TUI 在线程列表新增 `F` 快捷键，并在命令栏提供
+  `fetch-thread [--mailbox NAME] MESSAGE_ID`；后台任务完成后只刷新目标 mailbox，
+  保留当前选中项。
+
+### 20.2 风险与后续动作
+
+- 邮件服务器可能不支持完整的 header search，当前失败会保留可诊断的 IMAP 错误；后续
+  可增加服务端 capability 探测和受控的全量 header 回退。
+- thread endpoint 与归档服务的 URL 形态仍由外部站点决定，当前通过候选路由、gzip 解码和
+  重试复用现有同步错误处理；后续可增加失败缓存和限流。
 
 ---
 

@@ -15,7 +15,8 @@ use crate::domain::subscriptions::uses_gnu_qemu_archive;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::imap::{
-    FixtureImapClient, GnuArchiveClient, ImapClient, LoreImapClient, RemoteImapClient, RemoteMail,
+    FixtureImapClient, GnuArchiveClient, ImapClient, LoreImapClient, MailboxSnapshot,
+    RemoteImapClient, RemoteMail,
 };
 use crate::infra::mail_parser::{self, ParsedMailHeaders};
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch};
@@ -41,6 +42,13 @@ pub struct SyncRequest {
     pub mailbox: String,
     pub fixture_dir: Option<PathBuf>,
     pub uidvalidity: Option<u64>,
+    pub reconnect_attempts: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadFetchRequest {
+    pub mailbox: String,
+    pub message_id: String,
     pub reconnect_attempts: u8,
 }
 
@@ -116,6 +124,48 @@ pub fn run(config: &RuntimeConfig, request: SyncRequest) -> Result<SyncSummary> 
     }))
 }
 
+pub fn fetch_thread(config: &RuntimeConfig, request: ThreadFetchRequest) -> Result<SyncSummary> {
+    let source = resolve_sync_source(
+        config,
+        &SyncRequest {
+            mailbox: request.mailbox.clone(),
+            fixture_dir: None,
+            uidvalidity: None,
+            reconnect_attempts: request.reconnect_attempts,
+        },
+    )?;
+    let attempts = request.reconnect_attempts.max(1);
+    let mut last_error: Option<CriewError> = None;
+
+    for attempt in 1..=attempts {
+        match fetch_thread_once(config, &request.mailbox, &request.message_id, &source) {
+            Ok(summary) => return Ok(summary),
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    attempts,
+                    mailbox = %request.mailbox,
+                    message_id = %request.message_id,
+                    source = %source.label(),
+                    error = %error,
+                    "thread fetch attempt failed"
+                );
+                last_error = Some(error);
+                if attempt < attempts {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        CriewError::new(
+            ErrorCode::Imap,
+            format!("thread fetch failed after {} attempts", attempts),
+        )
+    }))
+}
+
 fn resolve_sync_source(config: &RuntimeConfig, request: &SyncRequest) -> Result<SyncSource> {
     if let Some(fixture_dir) = request.fixture_dir.as_ref() {
         return Ok(SyncSource::Fixture {
@@ -148,6 +198,119 @@ fn resolve_sync_source(config: &RuntimeConfig, request: &SyncRequest) -> Result<
 
     Ok(SyncSource::Lore {
         base_url: config.lore_base_url.clone(),
+    })
+}
+
+fn fetch_thread_once(
+    config: &RuntimeConfig,
+    mailbox: &str,
+    message_id: &str,
+    source: &SyncSource,
+) -> Result<SyncSummary> {
+    let checkpoint = mail_store::load_mailbox_state(&config.database_path, mailbox)?;
+    let checkpoint_last_seen_uid = checkpoint
+        .as_ref()
+        .map(|state| state.last_seen_uid)
+        .unwrap_or(0);
+    let mut client: Box<dyn ImapClient> = match source {
+        SyncSource::Fixture {
+            fixture_dir,
+            uidvalidity_hint,
+        } => Box::new(FixtureImapClient::new(
+            fixture_dir.to_path_buf(),
+            *uidvalidity_hint,
+        )),
+        SyncSource::Imap => Box::new(RemoteImapClient::new(config.imap.clone())?),
+        SyncSource::GnuArchive => Box::new(GnuArchiveClient::new(None)?),
+        SyncSource::Lore { base_url } => Box::new(LoreImapClient::new(Some(base_url))?),
+    };
+
+    client.connect()?;
+    let snapshot = match source {
+        SyncSource::Lore { .. } => {
+            // A native public-inbox thread endpoint is independent of the
+            // mailbox's recent Atom feed. Reuse the persisted checkpoint so
+            // an old thread can still be recovered after it leaves the feed.
+            MailboxSnapshot {
+                uidvalidity: checkpoint
+                    .as_ref()
+                    .map(|state| state.uidvalidity)
+                    .unwrap_or(1),
+                highest_uid: checkpoint_last_seen_uid,
+                highest_modseq: checkpoint.as_ref().and_then(|state| state.highest_modseq),
+            }
+        }
+        _ => client.select_mailbox(mailbox)?,
+    };
+    let remote_messages = client.fetch_thread(mailbox, message_id)?;
+    let envelopes = parse_remote_messages(mailbox, remote_messages);
+    let requested_message_id = normalize_requested_message_id(message_id);
+    if !envelopes
+        .iter()
+        .any(|envelope| envelope.parsed.message_id == requested_message_id)
+    {
+        return Err(CriewError::new(
+            ErrorCode::Imap,
+            format!("fetched thread does not contain Message-ID '{message_id}'"),
+        ));
+    }
+
+    let fetched = envelopes.len();
+    let mut incoming = Vec::with_capacity(fetched);
+    let mut synthetic_uid = checkpoint_last_seen_uid;
+    for envelope in envelopes {
+        let mut remote = envelope.remote;
+        if remote.uid == 0 {
+            synthetic_uid = synthetic_uid.saturating_add(1);
+            remote.uid = synthetic_uid;
+        }
+
+        let raw_path = persist_raw_mail(config, mailbox, remote.uid, &remote.raw)?;
+        incoming.push(IncomingMail {
+            mailbox: mailbox.to_string(),
+            uid: remote.uid,
+            modseq: remote.modseq,
+            flags: remote.flags,
+            raw_path,
+            parsed: envelope.parsed,
+        });
+    }
+
+    let fetched_highest_uid = incoming
+        .iter()
+        .map(|mail| mail.uid)
+        .max()
+        .unwrap_or(checkpoint_last_seen_uid);
+    let fetched_highest_modseq = incoming.iter().filter_map(|mail| mail.modseq).max();
+    let batch_highest_uid = snapshot
+        .highest_uid
+        .max(fetched_highest_uid)
+        .max(checkpoint_last_seen_uid);
+    let batch_highest_modseq = max_option(snapshot.highest_modseq, fetched_highest_modseq);
+
+    let write_result = mail_store::apply_sync_batch(
+        &config.database_path,
+        SyncBatch {
+            mailbox: mailbox.to_string(),
+            uidvalidity: snapshot.uidvalidity,
+            highest_uid: batch_highest_uid,
+            highest_modseq: batch_highest_modseq,
+            mails: incoming,
+        },
+    )?;
+
+    Ok(SyncSummary {
+        mailbox: write_result.state.mailbox.clone(),
+        source: source.label(),
+        fetched,
+        inserted: write_result.inserted,
+        updated: write_result.updated,
+        rebuilt_roots: write_result.rebuilt_roots,
+        mailbox_rebuilt: write_result.mailbox_rebuilt,
+        uidvalidity: write_result.state.uidvalidity,
+        checkpoint_last_seen_uid: write_result.state.last_seen_uid,
+        checkpoint_highest_modseq: write_result.state.highest_modseq,
+        checkpoint_synced_at: write_result.state.synced_at.clone(),
     })
 }
 
@@ -351,6 +514,14 @@ fn parse_remote_messages(
             RemoteMailEnvelope { remote, parsed }
         })
         .collect()
+}
+
+fn normalize_requested_message_id(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string()
 }
 
 fn select_initial_inbox_messages(

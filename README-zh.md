@@ -24,8 +24,15 @@ English README: [README.md](README.md)
 cargo install criew
 criew doctor
 criew sync --mailbox io-uring
+# 按 Message-ID 补齐完整对话，并重建本地 thread。
+criew fetch-thread --mailbox io-uring '<reply@example.com>'
 criew tui
 ```
+
+如果增量同步只拿到了一部分对话，可以对其中任意一封邮件的
+`Message-ID` 运行 `fetch-thread`。命令会沿着 `References`/`In-Reply-To`
+查找并幂等写入缺失邮件；TUI 中也可以在线程列表选中邮件后按 `F`，或在
+命令栏输入 `fetch-thread MESSAGE_ID`。
 
 GitHub Releases 会发布源码包、
 独立二进制文件、

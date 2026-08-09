@@ -199,6 +199,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
         description: "Sync mailbox now",
     },
     PaletteCommand {
+        name: "fetch-thread",
+        description: "Fetch the complete thread for a Message-ID",
+    },
+    PaletteCommand {
         name: "config",
         description: "Open visual config editor or update runtime config",
     },
@@ -385,6 +389,7 @@ type ExternalEditorRunner =
 type ReplyIdentityResolver = fn() -> std::result::Result<ReplyIdentity, String>;
 type ReplySendExecutor = fn(&RuntimeConfig, &SendRequest) -> SendOutcome;
 type MailboxSyncSpawner = fn(RuntimeConfig, Vec<String>) -> Receiver<StartupSyncEvent>;
+type ThreadFetchSpawner = fn(RuntimeConfig, String, String) -> Receiver<ThreadFetchEvent>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingMainPageCountState {
@@ -412,6 +417,22 @@ enum StartupSyncEvent {
         error: String,
     },
     WorkerCompleted,
+}
+
+#[derive(Debug, Clone)]
+enum ThreadFetchEvent {
+    Finished {
+        mailbox: String,
+        message_id: String,
+        fetched: usize,
+        inserted: usize,
+        updated: usize,
+    },
+    Failed {
+        mailbox: String,
+        message_id: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,6 +656,13 @@ struct SubscriptionAutoSyncState {
     receiver: Option<Receiver<StartupSyncEvent>>,
     next_due_at: Instant,
     in_flight_mailboxes: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct ThreadFetchState {
+    receiver: Receiver<ThreadFetchEvent>,
+    mailbox: String,
+    message_id: String,
 }
 
 impl SubscriptionAutoSyncState {
@@ -1314,11 +1342,13 @@ struct AppState {
     reply_send_executor: ReplySendExecutor,
     mailbox_sync_spawner: MailboxSyncSpawner,
     manual_sync_spawner: MailboxSyncSpawner,
+    thread_fetch_spawner: ThreadFetchSpawner,
     needs_terminal_refresh: bool,
     startup_sync: Option<StartupSyncState>,
     inbox_auto_sync: Option<InboxAutoSyncState>,
     manual_sync: Option<ManualSyncState>,
     subscription_auto_sync: Option<SubscriptionAutoSyncState>,
+    thread_fetch: Option<ThreadFetchState>,
     main_page_keymap: ResolvedMainPageKeymap,
     pending_main_page_sequence: Option<PendingMainPageSequenceState>,
     pending_main_page_count: Option<PendingMainPageCountState>,
@@ -1436,11 +1466,13 @@ impl AppState {
             reply_send_executor: send_reply_message,
             mailbox_sync_spawner: spawn_startup_sync_worker,
             manual_sync_spawner: spawn_startup_sync_worker,
+            thread_fetch_spawner: spawn_thread_fetch_worker,
             needs_terminal_refresh: false,
             startup_sync: None,
             inbox_auto_sync: None,
             manual_sync: None,
             subscription_auto_sync: None,
+            thread_fetch: None,
             main_page_keymap,
             pending_main_page_sequence: None,
             pending_main_page_count: None,
@@ -2004,6 +2036,158 @@ impl AppState {
 
     fn queue_palette_sync(&mut self, requested_mailboxes: Vec<String>) {
         let _ = self.start_manual_sync(requested_mailboxes, ManualSyncOrigin::PaletteCommand);
+    }
+
+    fn start_thread_fetch(&mut self, message_id: String) {
+        let mailbox = self.active_thread_mailbox.clone();
+        self.start_thread_fetch_for_mailbox(mailbox, message_id);
+    }
+
+    fn start_thread_fetch_for_mailbox(&mut self, mailbox: String, message_id: String) {
+        let message_id = message_id.trim().to_string();
+        if message_id.is_empty() {
+            self.status = "thread fetch requires a Message-ID".to_string();
+            return;
+        }
+        if self.thread_fetch.is_some() {
+            self.status = "a complete thread fetch is already running".to_string();
+            return;
+        }
+
+        let receiver =
+            (self.thread_fetch_spawner)(self.runtime.clone(), mailbox.clone(), message_id.clone());
+        self.thread_fetch = Some(ThreadFetchState {
+            receiver,
+            mailbox: mailbox.clone(),
+            message_id: message_id.clone(),
+        });
+        self.status = format!(
+            "fetching complete thread for <{}> in {}...",
+            message_id.trim_matches(['<', '>']),
+            mailbox
+        );
+        tracing::info!(
+            op = "thread_fetch",
+            status = "started",
+            mailbox = %mailbox,
+            message_id = %message_id
+        );
+    }
+
+    fn queue_palette_thread_fetch(&mut self, command: &str) {
+        let mut parts = command.split_whitespace().skip(1);
+        let mut mailbox = self.active_thread_mailbox.clone();
+        let mut message_id = None;
+
+        while let Some(part) = parts.next() {
+            if part == "--mailbox" {
+                let Some(value) = parts.next() else {
+                    self.status = "fetch-thread --mailbox requires a mailbox".to_string();
+                    return;
+                };
+                mailbox = value.to_string();
+            } else if message_id.is_none() {
+                message_id = Some(part.to_string());
+            } else {
+                self.status = "usage: fetch-thread [--mailbox NAME] MESSAGE_ID".to_string();
+                return;
+            }
+        }
+
+        let Some(message_id) = message_id else {
+            self.status = "usage: fetch-thread [--mailbox NAME] MESSAGE_ID".to_string();
+            return;
+        };
+        self.start_thread_fetch_for_mailbox(mailbox, message_id);
+    }
+
+    fn pump_thread_fetch_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        {
+            let Some(state) = self.thread_fetch.as_ref() else {
+                return;
+            };
+            loop {
+                match state.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                ThreadFetchEvent::Finished {
+                    mailbox,
+                    message_id,
+                    fetched,
+                    inserted,
+                    updated,
+                } => {
+                    self.thread_fetch = None;
+                    if same_mailbox_name(&mailbox, &self.active_thread_mailbox)
+                        && let Err(error) =
+                            self.reload_mailbox_threads_preserving_selection(&mailbox)
+                    {
+                        self.status =
+                            format!("thread fetched but failed to reload {}: {}", mailbox, error);
+                    } else {
+                        self.status = format!(
+                            "thread fetched <{}>: {} mail(s), {} inserted, {} updated",
+                            message_id.trim_matches(['<', '>']),
+                            fetched,
+                            inserted,
+                            updated
+                        );
+                    }
+                    tracing::info!(
+                        op = "thread_fetch",
+                        status = "succeeded",
+                        mailbox = %mailbox,
+                        message_id = %message_id,
+                        fetched,
+                        inserted,
+                        updated
+                    );
+                }
+                ThreadFetchEvent::Failed {
+                    mailbox,
+                    message_id,
+                    error,
+                } => {
+                    self.thread_fetch = None;
+                    self.status = format!(
+                        "thread fetch failed for <{}> in {}: {}",
+                        message_id.trim_matches(['<', '>']),
+                        mailbox,
+                        error
+                    );
+                    tracing::error!(
+                        op = "thread_fetch",
+                        status = "failed",
+                        mailbox = %mailbox,
+                        message_id = %message_id,
+                        error = %error
+                    );
+                }
+            }
+        }
+
+        if disconnected && self.thread_fetch.is_some() {
+            let state = self.thread_fetch.take();
+            if let Some(state) = state {
+                self.status = format!(
+                    "thread fetch worker disconnected for <{}> in {}",
+                    state.message_id.trim_matches(['<', '>']),
+                    state.mailbox
+                );
+            }
+        }
     }
 
     fn maybe_start_inbox_auto_sync(&mut self) {
@@ -4614,6 +4798,41 @@ fn spawn_startup_sync_worker(
     receiver
 }
 
+fn spawn_thread_fetch_worker(
+    runtime: RuntimeConfig,
+    mailbox: String,
+    message_id: String,
+) -> Receiver<ThreadFetchEvent> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let request = sync_worker::ThreadFetchRequest {
+            mailbox: mailbox.clone(),
+            message_id: message_id.clone(),
+            reconnect_attempts: PALETTE_SYNC_RECONNECT_ATTEMPTS,
+        };
+        match sync_worker::fetch_thread(&runtime, request) {
+            Ok(summary) => {
+                let _ = sender.send(ThreadFetchEvent::Finished {
+                    mailbox,
+                    message_id,
+                    fetched: summary.fetched,
+                    inserted: summary.inserted,
+                    updated: summary.updated,
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(ThreadFetchEvent::Failed {
+                    mailbox,
+                    message_id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    });
+
+    receiver
+}
+
 fn dedup_mailboxes(mailboxes: Vec<String>) -> Vec<String> {
     let mut deduped: Vec<String> = Vec::new();
     for mailbox in mailboxes {
@@ -4993,6 +5212,7 @@ fn tui_loop(
         state.pump_manual_sync_events();
         state.pump_inbox_auto_sync_events();
         state.pump_subscription_auto_sync_events();
+        state.pump_thread_fetch_events();
         state.maybe_start_inbox_auto_sync();
         state.maybe_start_subscription_auto_sync();
 

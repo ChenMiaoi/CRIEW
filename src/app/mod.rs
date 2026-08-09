@@ -79,6 +79,22 @@ pub fn run() -> Result<()> {
             run_sync_command(&runtime, &bootstrap_state, request, true)?;
             Ok(())
         }
+        cli::Command::FetchThread {
+            mailbox,
+            message_id,
+        } => {
+            let mailbox = mailbox.unwrap_or_else(|| runtime.source_mailbox.clone());
+            let summary = sync::fetch_thread(
+                &runtime,
+                sync::ThreadFetchRequest {
+                    mailbox,
+                    message_id,
+                    reconnect_attempts: DEFAULT_SYNC_RECONNECT_ATTEMPTS,
+                },
+            )?;
+            println!("{}", format_sync_summary(&summary));
+            Ok(())
+        }
         cli::Command::Doctor => {
             let b4_status = b4::check(runtime.b4_path.as_deref(), Some(&runtime.data_dir));
             let send_email_status = sendmail::check();

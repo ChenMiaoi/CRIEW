@@ -27,8 +27,16 @@ Chinese quick start: [README-zh.md](README-zh.md)
 cargo install criew
 criew doctor
 criew sync --mailbox io-uring
+# Fetch every message connected to one Message-ID and rebuild the local thread.
+criew fetch-thread --mailbox io-uring '<reply@example.com>'
 criew tui
 ```
+
+When an incremental sync only captured part of a conversation, run
+`fetch-thread` with any Message-ID from that conversation. The command follows
+`References`/`In-Reply-To`, stores the newly fetched messages idempotently, and
+the TUI exposes the same action as `F` on a selected thread or
+`fetch-thread MESSAGE_ID` in the command palette.
 
 GitHub Releases publish source archives,
 standalone binaries,

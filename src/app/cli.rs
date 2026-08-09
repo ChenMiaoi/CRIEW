@@ -43,6 +43,15 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         reconnect_attempts: Option<u8>,
     },
+    /// Fetch and persist the complete thread containing a Message-ID.
+    FetchThread {
+        /// Mailbox or lore list to search.
+        #[arg(long)]
+        mailbox: Option<String>,
+        /// Message-ID identifying a mail in the target thread.
+        #[arg(value_name = "MESSAGE_ID")]
+        message_id: String,
+    },
     /// Run environment diagnostics.
     Doctor,
     /// Update CRIEW from crates.io using cargo install.

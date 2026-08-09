@@ -32,13 +32,13 @@ use super::reply::ReplyIdentity;
 use super::{
     AppState, CodeEditMode, CodePaneFocus, ExternalEditorProcessResult, LoopAction,
     MIN_MAIL_PREVIEW_WIDTH, MIN_MAIL_SUBSCRIPTIONS_WIDTH, MY_INBOX_LABEL, MailPaneLayout,
-    ManualSyncOrigin, ManualSyncRequestOutcome, ManualSyncState, Pane, ReplyEditMode, ReplySection,
-    StartupSyncEvent, StartupSyncMailboxStatus, StartupSyncState, SubscriptionItem, UiPage,
-    catch_sync_panic, code_edit_cursor_position, draw, extract_mail_body_preview,
-    extract_mail_preview, handle_key_event, is_palette_open_shortcut, is_palette_toggle,
-    load_source_file_preview, mail_page_panes, matching_commands, pick_external_editor,
-    resolve_palette_local_workdir, run_external_editor_session_with, sanitize_inline_ui_text,
-    subscription_line, thread_line,
+    ManualSyncOrigin, ManualSyncRequestOutcome, ManualSyncState, PALETTE_COMMANDS, Pane,
+    ReplyEditMode, ReplySection, StartupSyncEvent, StartupSyncMailboxStatus, StartupSyncState,
+    SubscriptionItem, UiPage, catch_sync_panic, code_edit_cursor_position, draw,
+    extract_mail_body_preview, extract_mail_preview, handle_key_event, is_palette_open_shortcut,
+    is_palette_toggle, load_source_file_preview, mail_page_panes, matching_commands,
+    pick_external_editor, resolve_palette_local_workdir, run_external_editor_session_with,
+    sanitize_inline_ui_text, subscription_line, thread_line,
 };
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -581,6 +581,15 @@ fn manual_sync_spawner_idle(
     receiver
 }
 
+fn thread_fetch_spawner_idle(
+    _runtime: RuntimeConfig,
+    _mailbox: String,
+    _message_id: String,
+) -> mpsc::Receiver<super::ThreadFetchEvent> {
+    let (_sender, receiver) = mpsc::channel();
+    receiver
+}
+
 fn manual_sync_spawner_seed_success(
     runtime: RuntimeConfig,
     mailboxes: Vec<String>,
@@ -631,15 +640,16 @@ fn type_text(state: &mut AppState, text: &str) {
 #[test]
 fn empty_query_returns_all_palette_commands() {
     let all = matching_commands("");
-    assert_eq!(all.len(), 8);
+    assert_eq!(all.len(), PALETTE_COMMANDS.len());
     assert_eq!(all[0].name, "config");
     assert_eq!(all[1].name, "exit");
-    assert_eq!(all[2].name, "help");
-    assert_eq!(all[3].name, "keymap");
-    assert_eq!(all[4].name, "quit");
-    assert_eq!(all[5].name, "restart");
-    assert_eq!(all[6].name, "sync");
-    assert_eq!(all[7].name, "vim");
+    assert_eq!(all[2].name, "fetch-thread");
+    assert_eq!(all[3].name, "help");
+    assert_eq!(all[4].name, "keymap");
+    assert_eq!(all[5].name, "quit");
+    assert_eq!(all[6].name, "restart");
+    assert_eq!(all[7].name, "sync");
+    assert_eq!(all[8].name, "vim");
 }
 
 #[test]
@@ -4313,6 +4323,45 @@ fn palette_sync_command_runs_via_handle_key_event() {
     assert!(state.manual_sync.is_some());
     assert!(!state.palette.open);
     assert!(state.palette.input.is_empty());
+}
+
+#[test]
+fn palette_fetch_thread_preserves_message_id_case_and_explicit_mailbox() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.thread_fetch_spawner = thread_fetch_spawner_idle;
+    state.palette.open = true;
+    state.palette.input = "fetch-thread --mailbox IO-URING <Patch@EXAMPLE.COM>".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    let fetch = state.thread_fetch.as_ref().expect("thread fetch queued");
+    assert_eq!(fetch.mailbox, "IO-URING");
+    assert_eq!(fetch.message_id, "<Patch@EXAMPLE.COM>");
+    assert!(!state.palette.open);
+}
+
+#[test]
+fn capital_f_queues_complete_thread_fetch_for_selected_thread() {
+    let mut state = AppState::new(
+        vec![sample_thread("thread", "Patch@EXAMPLE.COM", 0)],
+        test_runtime(),
+    );
+    state.thread_fetch_spawner = thread_fetch_spawner_idle;
+    state.focus = Pane::Threads;
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    let fetch = state.thread_fetch.as_ref().expect("thread fetch queued");
+    assert_eq!(fetch.mailbox, state.active_thread_mailbox);
+    assert_eq!(fetch.message_id, "Patch@EXAMPLE.COM");
 }
 
 #[test]
