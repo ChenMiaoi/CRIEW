@@ -16,7 +16,7 @@ use clap::Parser;
 use crate::infra::b4::{self, B4Status};
 use crate::infra::bootstrap;
 use crate::infra::config::{self, IMAP_INBOX_MAILBOX};
-use crate::infra::error::Result;
+use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::imap::{ImapClient, MailboxSnapshot, RemoteImapClient};
 use crate::infra::logging;
 use crate::infra::sendmail::{self, GitSendEmailCheck, GitSendEmailStatus, ReplyIdentity};
@@ -101,6 +101,43 @@ pub fn run() -> Result<()> {
             let entries = review::load_review_inbox(&runtime.database_path, &mailbox, mode)?;
             println!("{}", review::format_review_inbox(&mailbox, mode, &entries));
             Ok(())
+        }
+        cli::Command::Preflight {
+            mailbox,
+            message_id,
+        } => {
+            let mailbox = mailbox.unwrap_or_else(|| runtime.source_mailbox.clone());
+            let rows = crate::infra::mail_store::load_thread_rows_by_mailbox(
+                &runtime.database_path,
+                &mailbox,
+                100_000,
+            )?;
+            let target = rows
+                .iter()
+                .find(|row| message_ids_match(&row.message_id, &message_id))
+                .ok_or_else(|| {
+                    CriewError::new(
+                        ErrorCode::Command,
+                        format!(
+                            "message-id '{}' was not found in mailbox '{}'",
+                            message_id, mailbox
+                        ),
+                    )
+                })?;
+            let summaries = patch::build_series_index(&mailbox, &rows);
+            let summary = summaries.get(&target.thread_id).ok_or_else(|| {
+                CriewError::new(
+                    ErrorCode::Command,
+                    format!("message-id '{}' is not part of a patch series", message_id),
+                )
+            })?;
+            let result = patch::run_preflight(&runtime, summary)?;
+            println!("{}", patch::format_preflight_report(summary, &result));
+            if result.passed {
+                Ok(())
+            } else {
+                Err(CriewError::new(ErrorCode::Command, result.summary))
+            }
         }
         cli::Command::Doctor => {
             let b4_status = b4::check(runtime.b4_path.as_deref(), Some(&runtime.data_dir));
@@ -382,6 +419,20 @@ fn format_sync_summary(summary: &sync::SyncSummary) -> String {
             .unwrap_or("<unknown>"),
         summary.mailbox_rebuilt
     )
+}
+
+fn message_ids_match(left: &str, right: &str) -> bool {
+    if left.trim() == right.trim() {
+        return true;
+    }
+    let normalize = |value: &str| {
+        value
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_ascii_lowercase()
+    };
+    normalize(left) == normalize(right)
 }
 
 fn format_update_summary(summary: &update::UpdateSummary) -> String {

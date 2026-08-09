@@ -209,6 +209,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
         description: "Show patch series that need review or have reviews",
     },
     PaletteCommand {
+        name: "preflight",
+        description: "Run checkpatch and maintainer checks for the selected patch series",
+    },
+    PaletteCommand {
         name: "config",
         description: "Open visual config editor or update runtime config",
     },
@@ -3785,6 +3789,36 @@ impl AppState {
                     error = %error
                 );
                 self.status = format!("{} failed: {}", action.name(), error);
+            }
+        }
+    }
+
+    fn run_patch_preflight(&mut self) {
+        tracing::info!(op = "patch.preflight", status = "started");
+        if !matches!(self.ui_page, UiPage::Mail) {
+            self.status = "patch preflight is only available on mail page".to_string();
+            return;
+        }
+
+        let Some(series) = self.selected_series().cloned() else {
+            self.status = "current thread is not a patch series".to_string();
+            return;
+        };
+
+        match patch_worker::run_preflight(&self.runtime, &series) {
+            Ok(result) => {
+                self.status = format!("preflight: {}", result.summary);
+                tracing::info!(
+                    op = "patch.preflight",
+                    status = result.status_label(),
+                    summary = %result.summary,
+                    checkpatch = result.checkpatch.status.as_str(),
+                    maintainers = result.maintainers.status.as_str(),
+                );
+            }
+            Err(error) => {
+                tracing::error!(op = "patch.preflight", status = "failed", error = %error);
+                self.status = format!("preflight failed: {error}");
             }
         }
     }

@@ -333,7 +333,7 @@ MVP 范围与阶段目标已迁移至独立文档：
 ### 14.1 已决策项
 
 - 工程结构采用四层模块：`app` / `domain` / `infra` / `ui`。
-- CLI 命令固定为：`tui`、`sync`、`fetch-thread`、`review-inbox`、`doctor`、`version`。
+- CLI 命令固定为：`tui`、`sync`、`fetch-thread`、`review-inbox`、`preflight`、`doctor`、`version`。
 - 配置读取采用 TOML，支持 `--config` 路径覆盖和默认目录策略。
 - 启动阶段统一执行目录引导与 SQLite 初始化迁移，`schema_version` 作为版本入口。
 - b4 检查顺序固定：配置路径 -> `CRIEW_B4_PATH` -> `vendor/b4/b4.sh` -> `PATH` 中 `b4`。
@@ -513,6 +513,28 @@ MVP 范围与阶段目标已迁移至独立文档：
   RFC 5322/MIME 签名边界识别，以及 `Link`、`Fixes` 等非 reviewer trailer 的专门视图。
 - Review Inbox 以已同步到本地的 patch series 为范围；后续可接入维护者/路径匹配和
   `get_maintainer.pl`，自动扩展“应该由谁 review”的候选队列。
+
+## 22. M11（已完成）：Patch Preflight
+
+### 22.1 已决策项
+
+- 新增 `preflight [--mailbox NAME] MESSAGE_ID` CLI 命令，以任意 patch 邮件定位
+  series，先检查 patch 数量、顺序、raw 文件可用性，再运行本地 kernel tree 中的
+  `scripts/checkpatch.pl --no-tree --terse` 与 `scripts/get_maintainer.pl
+  --no-git-fallback`。
+- checker 不是硬依赖：未找到脚本时标记为 `skipped`；`checkpatch.pl` 的非零退出
+  记录为 `findings`，维护者脚本失败或超时记录为 `failed`。series 不完整、文件缺失
+  或没有可检查的 raw 文件会阻止 preflight 通过。
+- 每次预检复用 `patch_series_run` 追加审计记录，并保留命令、退出码、超时、输出摘要；
+  不会改变已应用/审阅中的 series 状态。TUI 在线程焦点使用 `P`，命令栏使用
+  `preflight`，CLI 与 TUI 共用同一 app worker。
+
+### 22.2 风险与后续动作
+
+- `checkpatch.pl` 对邮件封装格式和 vendor 脚本版本的行为可能不同；当前传入已落盘的
+  raw 邮件并保留原始输出，后续可增加 MIME/mbox 归一化和按文件的结果分组。
+- `get_maintainer.pl` 依赖 kernel tree 的路径与 git 元数据；未配置 tree 时只报告
+  checker 缺失，不伪造维护者列表。
 
 ---
 

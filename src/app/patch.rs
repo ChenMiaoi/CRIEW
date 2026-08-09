@@ -6,6 +6,7 @@
 //! work underneath.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -19,6 +20,7 @@ use crate::infra::mail_store::ThreadRow;
 use crate::infra::patch_store;
 
 const B4_ACTION_TIMEOUT: Duration = Duration::from_secs(120);
+const PREFLIGHT_ACTION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_LOG_BYTES: usize = 16 * 1024;
 const DOWNLOAD_NAME_MAX_CHARS: usize = 72;
 const APPLY_ARTIFACTS_DIR: &str = "apply-artifacts";
@@ -27,6 +29,83 @@ const APPLY_ARTIFACTS_DIR: &str = "apply-artifacts";
 pub enum PatchAction {
     Apply,
     Download,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightToolStatus {
+    Passed,
+    Findings,
+    Failed,
+    Skipped,
+}
+
+impl PreflightToolStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Findings => "findings",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    fn is_blocking(self) -> bool {
+        matches!(self, Self::Findings | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreflightToolResult {
+    pub name: String,
+    pub status: PreflightToolStatus,
+    pub command_line: Option<String>,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub output: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PatchPreflightResult {
+    pub passed: bool,
+    pub integrity: SeriesIntegrity,
+    pub checked_files: usize,
+    pub expected_files: usize,
+    pub missing_files: Vec<String>,
+    pub checkpatch: PreflightToolResult,
+    pub maintainers: PreflightToolResult,
+    pub summary: String,
+}
+
+impl PatchPreflightResult {
+    pub fn status_label(&self) -> &'static str {
+        if self.passed { "passed" } else { "failed" }
+    }
+
+    pub fn timed_out(&self) -> bool {
+        self.checkpatch.timed_out || self.maintainers.timed_out
+    }
+
+    fn command_line(&self) -> String {
+        let commands = [&self.checkpatch, &self.maintainers]
+            .into_iter()
+            .filter_map(|tool| tool.command_line.as_deref())
+            .collect::<Vec<_>>();
+        if commands.is_empty() {
+            "preflight (no local checker available)".to_string()
+        } else {
+            format!("preflight: {}", commands.join("; "))
+        }
+    }
+
+    fn output(&self) -> String {
+        let mut sections = Vec::new();
+        for tool in [&self.checkpatch, &self.maintainers] {
+            if !tool.output.trim().is_empty() {
+                sections.push(format!("[{}]\n{}", tool.name, tool.output.trim()));
+            }
+        }
+        sections.join("\n\n")
+    }
 }
 
 impl PatchAction {
@@ -200,6 +279,284 @@ pub fn load_latest_report(
     thread_id: i64,
 ) -> Result<Option<patch_store::SeriesLatestReport>> {
     patch_store::load_latest_report(database_path, mailbox, thread_id)
+}
+
+pub fn run_preflight(
+    runtime: &RuntimeConfig,
+    summary: &SeriesSummary,
+) -> Result<PatchPreflightResult> {
+    let record = upsert_series_summary(runtime, summary)?;
+    let (files, missing_files) = collect_preflight_files(summary);
+    let checker_ready =
+        summary.integrity.is_ready() && missing_files.is_empty() && !files.is_empty();
+
+    let (checkpatch, maintainers) = if checker_ready {
+        let mut checkpatch_args = vec![
+            "--no-tree".to_string(),
+            "--terse".to_string(),
+            "--".to_string(),
+        ];
+        checkpatch_args.extend(files.iter().map(|path| path.display().to_string()));
+
+        let mut maintainer_args = vec!["--no-git-fallback".to_string(), "--".to_string()];
+        maintainer_args.extend(files.iter().map(|path| path.display().to_string()));
+
+        (
+            run_preflight_tool(runtime, "checkpatch.pl", &checkpatch_args, true),
+            run_preflight_tool(runtime, "get_maintainer.pl", &maintainer_args, false),
+        )
+    } else {
+        let reason = if !summary.integrity.is_ready() {
+            summary
+                .integrity_reason()
+                .unwrap_or_else(|| "series is not complete".to_string())
+        } else if !missing_files.is_empty() {
+            "one or more raw patch files are missing".to_string()
+        } else {
+            "no raw patch files are available".to_string()
+        };
+        (
+            skipped_preflight_tool("checkpatch.pl", &reason),
+            skipped_preflight_tool("get_maintainer.pl", &reason),
+        )
+    };
+
+    let passed = summary.integrity.is_ready()
+        && missing_files.is_empty()
+        && !files.is_empty()
+        && !checkpatch.status.is_blocking()
+        && !maintainers.status.is_blocking();
+    let mut result = PatchPreflightResult {
+        passed,
+        integrity: summary.integrity,
+        checked_files: files.len(),
+        expected_files: summary.items.len(),
+        missing_files,
+        checkpatch,
+        maintainers,
+        summary: String::new(),
+    };
+
+    // Build the human-readable summary after the tool results are known so the
+    // same line can be persisted and shown in the TUI status bar.
+    result.summary = format!(
+        "patch preflight {}: integrity={} files={}/{} checkpatch={} maintainers={}",
+        result.status_label(),
+        result.integrity.as_str(),
+        result.checked_files,
+        result.expected_files,
+        result.checkpatch.status.as_str(),
+        result.maintainers.status.as_str(),
+    );
+
+    let command_line = result.command_line();
+    let output = truncate_output(&result.output());
+    let last_error = (!result.passed).then(|| result.summary.clone());
+    patch_store::update_series_result(
+        &runtime.database_path,
+        record.id,
+        &patch_store::SeriesResultUpdate {
+            status: summary.status,
+            last_error,
+            last_command: Some(command_line.clone()),
+            last_exit_code: result.checkpatch.exit_code.or(result.maintainers.exit_code),
+            last_stdout: Some(output.clone()),
+            last_stderr: None,
+            output_path: None,
+        },
+    )?;
+    patch_store::insert_series_run(
+        &runtime.database_path,
+        &patch_store::SeriesRunRequest {
+            series_id: record.id,
+            action: "preflight".to_string(),
+            command: command_line,
+            status: result.status_label().to_string(),
+            exit_code: result.checkpatch.exit_code.or(result.maintainers.exit_code),
+            timed_out: result.timed_out(),
+            summary: Some(result.summary.clone()),
+            stdout: Some(output),
+            stderr: None,
+            output_path: None,
+        },
+    )?;
+
+    Ok(result)
+}
+
+pub fn format_preflight_report(summary: &SeriesSummary, result: &PatchPreflightResult) -> String {
+    let mut lines = vec![
+        "patch preflight".to_string(),
+        format!("  series: v{} {}", summary.version, summary.subject),
+        format!("  integrity: {}", result.integrity.as_str()),
+        format!(
+            "  files: {}/{} checked",
+            result.checked_files, result.expected_files
+        ),
+        format!("  checkpatch.pl: {}", result.checkpatch.status.as_str()),
+        format!(
+            "  get_maintainer.pl: {}",
+            result.maintainers.status.as_str()
+        ),
+        format!("  result: {}", result.status_label()),
+    ];
+    if !result.missing_files.is_empty() {
+        lines.push(format!(
+            "  missing_files: {}",
+            result.missing_files.join(", ")
+        ));
+    }
+    for tool in [&result.checkpatch, &result.maintainers] {
+        if let Some(command) = tool.command_line.as_deref() {
+            lines.push(format!("  {} command: {}", tool.name, command));
+        }
+        if !tool.output.trim().is_empty() {
+            lines.push(format!("  {} output:\n{}", tool.name, tool.output.trim()));
+        }
+    }
+    lines.join("\n")
+}
+
+fn upsert_series_summary(
+    runtime: &RuntimeConfig,
+    summary: &SeriesSummary,
+) -> Result<patch_store::SeriesRecord> {
+    patch_store::upsert_series(
+        &runtime.database_path,
+        &patch_store::UpsertSeriesRequest {
+            mailbox: summary.mailbox.clone(),
+            thread_id: summary.thread_id,
+            version: summary.version,
+            expected_total: summary.expected_total,
+            author: summary.author.clone(),
+            subject: summary.subject.clone(),
+            anchor_message_id: summary.anchor_message_id.clone(),
+            integrity: summary.integrity.as_str().to_string(),
+            missing_seq: summary.missing_seq.clone(),
+            duplicate_seq: summary.duplicate_seq.clone(),
+            out_of_order: summary.out_of_order,
+            items: summary
+                .items
+                .iter()
+                .map(|item| patch_store::UpsertSeriesItem {
+                    seq: item.seq,
+                    total: item.total,
+                    mail_id: item.mail_id,
+                    message_id: item.message_id.clone(),
+                    subject: item.subject.clone(),
+                    raw_path: item.raw_path.clone(),
+                    sort_ord: item.sort_ord,
+                })
+                .collect(),
+        },
+    )
+}
+
+fn collect_preflight_files(summary: &SeriesSummary) -> (Vec<PathBuf>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for item in &summary.items {
+        let Some(path) = item.raw_path.as_ref() else {
+            missing.push(format!("mail_id={}", item.mail_id));
+            continue;
+        };
+        if path.is_file() {
+            if seen.insert(path.clone()) {
+                files.push(path.clone());
+            }
+        } else {
+            missing.push(path.display().to_string());
+        }
+    }
+    (files, missing)
+}
+
+fn run_preflight_tool(
+    runtime: &RuntimeConfig,
+    name: &str,
+    args: &[String],
+    nonzero_is_findings: bool,
+) -> PreflightToolResult {
+    let Some(program) = resolve_preflight_tool(runtime, name) else {
+        return skipped_preflight_tool(name, "not found in configured kernel trees or PATH");
+    };
+    let command_line = render_preflight_command(&program, args);
+    let working_dir = program
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "scripts"))
+        .and_then(Path::parent)
+        .or_else(|| runtime.kernel_trees.first().map(PathBuf::as_path));
+    match b4::run_program(&program, args, PREFLIGHT_ACTION_TIMEOUT, working_dir) {
+        Ok(output) => {
+            let status = if output.timed_out {
+                PreflightToolStatus::Failed
+            } else if output.exit_code == Some(0) {
+                PreflightToolStatus::Passed
+            } else if nonzero_is_findings {
+                PreflightToolStatus::Findings
+            } else {
+                PreflightToolStatus::Failed
+            };
+            let mut details = output.stdout;
+            if !output.stderr.trim().is_empty() {
+                if !details.trim().is_empty() {
+                    details.push_str("\n\n[stderr]\n");
+                }
+                details.push_str(&output.stderr);
+            }
+            PreflightToolResult {
+                name: name.to_string(),
+                status,
+                command_line: Some(output.command_line),
+                exit_code: output.exit_code,
+                timed_out: output.timed_out,
+                output: truncate_output(&details),
+            }
+        }
+        Err(error) => PreflightToolResult {
+            name: name.to_string(),
+            status: PreflightToolStatus::Failed,
+            command_line: Some(command_line),
+            exit_code: None,
+            timed_out: false,
+            output: error.to_string(),
+        },
+    }
+}
+
+fn skipped_preflight_tool(name: &str, reason: &str) -> PreflightToolResult {
+    PreflightToolResult {
+        name: name.to_string(),
+        status: PreflightToolStatus::Skipped,
+        command_line: None,
+        exit_code: None,
+        timed_out: false,
+        output: reason.to_string(),
+    }
+}
+
+fn resolve_preflight_tool(runtime: &RuntimeConfig, name: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for tree in &runtime.kernel_trees {
+        candidates.push(tree.join("scripts").join(name));
+    }
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join("scripts").join(name));
+    }
+    if let Some(path_var) = env::var_os("PATH") {
+        for directory in env::split_paths(&path_var) {
+            candidates.push(directory.join(name));
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn render_preflight_command(program: &Path, args: &[String]) -> String {
+    let mut pieces = Vec::with_capacity(args.len() + 1);
+    pieces.push(program.display().to_string());
+    pieces.extend(args.iter().cloned());
+    pieces.join(" ")
 }
 
 pub fn run_action(
@@ -563,8 +920,8 @@ fn analyze_thread_series(
         .collect();
 
     let items: Vec<SeriesItem> = by_seq
-        .iter()
-        .filter_map(|(_, values)| values.iter().min_by_key(|candidate| candidate.sort_ord))
+        .values()
+        .filter_map(|values| values.iter().min_by_key(|candidate| candidate.sort_ord))
         .map(|candidate| SeriesItem {
             seq: candidate.parsed.seq,
             total: candidate.parsed.total,
@@ -1145,11 +1502,11 @@ mod tests {
     use crate::infra::patch_store;
 
     use super::{
-        APPLY_ARTIFACTS_DIR, PatchAction, SeriesIntegrity, action_args, action_subcommand,
-        action_working_dir, build_series_index, download_series_name, hydrate_series_statuses,
-        load_latest_report, parse_patch_subject, parse_seq_total_token, parse_version_token,
-        relocate_new_apply_artifacts, run_action, snapshot_apply_artifacts,
-        subject_is_patch_related, undo_last_apply,
+        APPLY_ARTIFACTS_DIR, PatchAction, PreflightToolStatus, SeriesIntegrity, action_args,
+        action_subcommand, action_working_dir, build_series_index, download_series_name,
+        hydrate_series_statuses, load_latest_report, parse_patch_subject, parse_seq_total_token,
+        parse_version_token, relocate_new_apply_artifacts, run_action, run_preflight,
+        snapshot_apply_artifacts, subject_is_patch_related, undo_last_apply,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1372,6 +1729,72 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
 
         summary.status = PatchSeriesStatus::Conflict;
         assert_eq!(summary.status_label(), "conflict");
+    }
+
+    #[test]
+    fn preflight_runs_kernel_checkers_and_persists_audit() {
+        let root = temp_dir("preflight-checkers");
+        let tree = root.join("linux");
+        let scripts = tree.join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts directory");
+        write_script(
+            &scripts,
+            "checkpatch.pl",
+            "#!/bin/sh\nprintf 'checkpatch inspected %s\\n' \"$4\"\nexit 0\n",
+        );
+        write_script(
+            &scripts,
+            "get_maintainer.pl",
+            "#!/bin/sh\nprintf 'Alice Maintainer <alice@example.com>\\n'\nexit 0\n",
+        );
+        let raw_path = root.join("patch.eml");
+        fs::write(&raw_path, "Subject: [PATCH 1/1] demo\n\nbody\n").expect("write raw patch");
+
+        let runtime = runtime_in(&root, vec![tree]);
+        initialize_patch_runtime(&runtime, &[(1, "patch@example.com")]);
+        let mut summary = sample_summary("[PATCH 1/1] demo", 1);
+        summary.items[0].raw_path = Some(raw_path);
+
+        let result = run_preflight(&runtime, &summary).expect("run preflight");
+
+        assert!(result.passed);
+        assert_eq!(result.checked_files, 1);
+        assert_eq!(result.checkpatch.status, PreflightToolStatus::Passed);
+        assert_eq!(result.maintainers.status, PreflightToolStatus::Passed);
+        assert!(result.maintainers.output.contains("Alice Maintainer"));
+        assert!(result.summary.contains("checkpatch=passed"));
+        let report = load_latest_report(&runtime.database_path, "io-uring", 42)
+            .expect("load preflight report")
+            .expect("preflight report should exist");
+        assert!(
+            report
+                .last_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("patch preflight passed"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_blocks_incomplete_series_without_running_tools() {
+        let root = temp_dir("preflight-incomplete");
+        let runtime = runtime_in(&root, Vec::new());
+        initialize_patch_runtime(&runtime, &[(1, "patch@example.com")]);
+        let mut summary = sample_summary("[PATCH 1/2] demo", 1);
+        summary.expected_total = 2;
+        summary.integrity = SeriesIntegrity::Missing;
+        summary.missing_seq = vec![2];
+
+        let result = run_preflight(&runtime, &summary).expect("run preflight");
+
+        assert!(!result.passed);
+        assert_eq!(result.checkpatch.status, PreflightToolStatus::Skipped);
+        assert_eq!(result.maintainers.status, PreflightToolStatus::Skipped);
+        assert!(result.summary.contains("integrity=missing"));
+        assert!(result.checkpatch.output.contains("missing patch index: 2"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

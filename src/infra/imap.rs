@@ -2122,10 +2122,8 @@ fn parse_lore_atom_entries(xml: &str) -> Result<Vec<LoreFeedEntry>> {
                                 Some(current_modseq.map_or(modseq, |prev| prev.max(modseq)));
                         }
                     }
-                    Some(b"id") => {
-                        if current_id.is_none() {
-                            current_id = Some(text.into_owned());
-                        }
+                    Some(b"id") if current_id.is_none() => {
+                        current_id = Some(text.into_owned());
                     }
                     _ => {}
                 }

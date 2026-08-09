@@ -31,6 +31,8 @@ criew sync --mailbox io-uring
 criew fetch-thread --mailbox io-uring '<reply@example.com>'
 # List patch series that still need a Reviewed-by trailer.
 criew review-inbox --mailbox io-uring
+# Run checkpatch.pl and get_maintainer.pl before applying a series.
+criew preflight --mailbox io-uring '<patch@example.com>'
 criew tui
 ```
 
@@ -44,6 +46,11 @@ the TUI exposes the same action as `F` on a selected thread or
 from each patch thread. Use `--mode reviewed` to show picked series or
 `--mode all` to inspect both queues; the TUI offers the same views through
 `review-inbox [needs-review|reviewed|all|off]` in the command palette.
+
+`preflight` validates series completeness, runs the kernel tree's
+`scripts/checkpatch.pl` and `scripts/get_maintainer.pl` when available, and
+persists the result in the patch run history. The TUI exposes the same check
+as `P` on a selected patch series or `preflight` in the command palette.
 
 GitHub Releases publish source archives,
 standalone binaries,

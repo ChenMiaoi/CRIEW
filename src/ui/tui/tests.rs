@@ -649,11 +649,12 @@ fn empty_query_returns_all_palette_commands() {
     assert_eq!(all[2].name, "fetch-thread");
     assert_eq!(all[3].name, "help");
     assert_eq!(all[4].name, "keymap");
-    assert_eq!(all[5].name, "quit");
-    assert_eq!(all[6].name, "restart");
-    assert_eq!(all[7].name, "review-inbox");
-    assert_eq!(all[8].name, "sync");
-    assert_eq!(all[9].name, "vim");
+    assert_eq!(all[5].name, "preflight");
+    assert_eq!(all[6].name, "quit");
+    assert_eq!(all[7].name, "restart");
+    assert_eq!(all[8].name, "review-inbox");
+    assert_eq!(all[9].name, "sync");
+    assert_eq!(all[10].name, "vim");
 }
 
 #[test]
@@ -4595,6 +4596,13 @@ fn a_d_and_u_require_patch_series_or_apply_snapshot_on_thread_focus() {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
     );
     assert!(matches!(action_download, LoopAction::Continue));
+    assert!(state.status.contains("not a patch series"));
+
+    let action_preflight = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_preflight, LoopAction::Continue));
     assert!(state.status.contains("not a patch series"));
 
     let action_undo = handle_key_event(

@@ -71,6 +71,15 @@ pub enum Command {
         #[arg(long, value_enum, default_value = "needs-review")]
         mode: ReviewInboxMode,
     },
+    /// Run local patch integrity, style, and maintainer checks for a series.
+    Preflight {
+        /// Mailbox or lore list to inspect.
+        #[arg(long)]
+        mailbox: Option<String>,
+        /// Message-ID identifying any patch mail in the target series.
+        #[arg(value_name = "MESSAGE_ID")]
+        message_id: String,
+    },
     /// Run environment diagnostics.
     Doctor,
     /// Update CRIEW from crates.io using cargo install.
@@ -121,5 +130,28 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn preflight_parses_mailbox_and_message_id() {
+        let cli = Cli::try_parse_from([
+            "criew",
+            "preflight",
+            "--mailbox",
+            "io-uring",
+            "<patch@example.com>",
+        ])
+        .expect("parse preflight command");
+
+        match cli.command {
+            Some(Command::Preflight {
+                mailbox,
+                message_id,
+            }) => {
+                assert_eq!(mailbox.as_deref(), Some("io-uring"));
+                assert_eq!(message_id, "<patch@example.com>");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

@@ -28,6 +28,8 @@ criew sync --mailbox io-uring
 criew fetch-thread --mailbox io-uring '<reply@example.com>'
 # 列出还没有 Reviewed-by trailer 的 patch series。
 criew review-inbox --mailbox io-uring
+# 在应用前运行 checkpatch.pl 和 get_maintainer.pl。
+criew preflight --mailbox io-uring '<patch@example.com>'
 criew tui
 ```
 
@@ -40,6 +42,11 @@ criew tui
 `Tested-by` trailer。使用 `--mode reviewed` 查看已经收到 review 的 series，
 使用 `--mode all` 查看全部；TUI 命令栏对应支持
 `review-inbox [needs-review|reviewed|all|off]`。
+
+`preflight` 会先校验 series 是否完整；如果本地配置了 kernel tree，就执行
+`scripts/checkpatch.pl` 和 `scripts/get_maintainer.pl`，并把结果写入 patch
+运行历史。TUI 在线程列表选中 patch series 后按 `P`，或在命令栏输入
+`preflight`，可以执行同一项检查。
 
 GitHub Releases 会发布源码包、
 独立二进制文件、

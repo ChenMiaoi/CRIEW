@@ -192,6 +192,11 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         {
             state.run_patch_action(patch_worker::PatchAction::Download);
         }
+        KeyCode::Char('P')
+            if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Threads) =>
+        {
+            state.run_patch_preflight();
+        }
         KeyCode::Char('F')
             if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Threads) =>
         {
@@ -630,7 +635,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "restart" => return LoopAction::Restart,
                 "help" => {
                     state.status = format!(
-                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, review-inbox [needs-review|reviewed|all|off], config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, F fetch thread, u undo apply, e reply/inline edit, r reply, E external vim",
+                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, review-inbox [needs-review|reviewed|all|off], preflight, config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, P preflight, F fetch thread, u undo apply, e reply/inline edit, r reply, E external vim",
                         main_page_focus_shortcuts(&state.main_page_keymap),
                         main_page_move_shortcuts(&state.main_page_keymap)
                     );
@@ -645,6 +650,10 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 }
                 value if value.split_whitespace().next() == Some("review-inbox") => {
                     state.queue_palette_review_inbox(&raw_command);
+                    state.dismiss_palette();
+                }
+                "preflight" => {
+                    state.run_patch_preflight();
                     state.dismiss_palette();
                 }
                 value if value.split_whitespace().next() == Some("config") => {

@@ -93,9 +93,40 @@ pub fn run(
     run_with_resolved_command(&resolved, subcommand, args, timeout, working_dir)
 }
 
+/// Run an arbitrary local helper with the same timeout and output-capture
+/// guarantees as `b4`.
+///
+/// Patch preflight uses this for kernel-tree scripts such as `checkpatch.pl`
+/// and `get_maintainer.pl`; keeping process lifecycle here prevents each
+/// caller from inventing a subtly different timeout or spawn-error policy.
+pub fn run_program(
+    program: &Path,
+    args: &[String],
+    timeout: Duration,
+    working_dir: Option<&Path>,
+) -> Result<B4CommandResult> {
+    let resolved = ResolvedCommand {
+        command: program.display().to_string(),
+        display_path: program.to_path_buf(),
+    };
+    run_with_resolved_program(&resolved, args, timeout, working_dir)
+}
+
 fn run_with_resolved_command(
     resolved: &ResolvedCommand,
     subcommand: &str,
+    args: &[String],
+    timeout: Duration,
+    working_dir: Option<&Path>,
+) -> Result<B4CommandResult> {
+    let mut full_args = Vec::with_capacity(args.len() + 1);
+    full_args.push(subcommand.to_string());
+    full_args.extend(args.iter().cloned());
+    run_with_resolved_program(resolved, &full_args, timeout, working_dir)
+}
+
+fn run_with_resolved_program(
+    resolved: &ResolvedCommand,
     args: &[String],
     timeout: Duration,
     working_dir: Option<&Path>,
@@ -104,18 +135,17 @@ fn run_with_resolved_command(
     if let Some(working_dir) = working_dir {
         command.current_dir(working_dir);
     }
-    command.arg(subcommand);
     for arg in args {
         command.arg(arg);
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let command_line = render_command_line(&resolved.command, subcommand, args);
+    let command_line = render_program_command_line(&resolved.command, args);
     let mut child = spawn_command_with_retry(&mut command).map_err(|error| {
         CriewError::with_source(
             ErrorCode::B4,
             format!(
-                "failed to spawn b4 command '{}' ({})",
+                "failed to spawn external command '{}' ({})",
                 command_line,
                 resolved.display_path.display()
             ),
@@ -142,7 +172,10 @@ fn run_with_resolved_command(
             Err(error) => {
                 return Err(CriewError::with_source(
                     ErrorCode::B4,
-                    format!("failed while waiting for b4 command '{}'", command_line),
+                    format!(
+                        "failed while waiting for external command '{}'",
+                        command_line
+                    ),
                     error,
                 ));
             }
@@ -152,7 +185,10 @@ fn run_with_resolved_command(
     let output = child.wait_with_output().map_err(|error| {
         CriewError::with_source(
             ErrorCode::B4,
-            format!("failed to collect output for b4 command '{}'", command_line),
+            format!(
+                "failed to collect output for external command '{}'",
+                command_line
+            ),
             error,
         )
     })?;
@@ -356,10 +392,17 @@ fn resolve_from_candidates(candidates: Vec<Candidate>) -> Result<ResolvedCommand
     ))
 }
 
+#[cfg(test)]
 fn render_command_line(command: &str, subcommand: &str, args: &[String]) -> String {
-    let mut pieces = Vec::with_capacity(2 + args.len());
+    let mut full_args = Vec::with_capacity(args.len() + 1);
+    full_args.push(subcommand.to_string());
+    full_args.extend(args.iter().cloned());
+    render_program_command_line(command, &full_args)
+}
+
+fn render_program_command_line(command: &str, args: &[String]) -> String {
+    let mut pieces = Vec::with_capacity(1 + args.len());
     pieces.push(render_shell_token(command));
-    pieces.push(render_shell_token(subcommand));
     for arg in args {
         pieces.push(render_shell_token(arg));
     }
