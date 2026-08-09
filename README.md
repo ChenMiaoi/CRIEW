@@ -33,6 +33,8 @@ criew fetch-thread --mailbox io-uring '<reply@example.com>'
 criew review-inbox --mailbox io-uring
 # Run checkpatch.pl and get_maintainer.pl before applying a series.
 criew preflight --mailbox io-uring '<patch@example.com>'
+# List drafts and failed replies that can be retried.
+criew outbox
 criew tui
 ```
 
@@ -51,6 +53,11 @@ from each patch thread. Use `--mode reviewed` to show picked series or
 `scripts/checkpatch.pl` and `scripts/get_maintainer.pl` when available, and
 persists the result in the patch run history. The TUI exposes the same check
 as `P` on a selected patch series or `preflight` in the command palette.
+
+Reply drafts are saved in SQLite while the Reply Panel is open, and a failed
+`git send-email` keeps both the editable draft and failure details. Reopen the
+same mail to retry after fixing credentials or transport; `criew outbox` (or
+the TUI `outbox` command) lists pending drafts and failed sends.
 
 GitHub Releases publish source archives,
 standalone binaries,

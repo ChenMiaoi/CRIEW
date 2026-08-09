@@ -28,7 +28,9 @@ use crate::infra::bootstrap::BootstrapState;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::mail_store::{self, ThreadRow};
-use crate::infra::reply_store::{self, ReplySendRecordRequest, ReplySendStatus};
+use crate::infra::reply_store::{
+    self, ReplyDraft, ReplyDraftRequest, ReplyDraftStatus, ReplySendRecordRequest, ReplySendStatus,
+};
 use crate::infra::sendmail::{self, SendOutcome, SendRequest, SendStatus};
 use crate::infra::ui_state::{self, UiState};
 use chrono::Utc;
@@ -211,6 +213,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "preflight",
         description: "Run checkpatch and maintainer checks for the selected patch series",
+    },
+    PaletteCommand {
+        name: "outbox",
+        description: "List persisted reply drafts and failed sends",
     },
     PaletteCommand {
         name: "config",
@@ -954,6 +960,9 @@ struct ReplyPanelState {
     preview_confirmed: bool,
     preview_confirmed_at: Option<String>,
     reply_notice: Option<ReplyNoticeState>,
+    draft_status: ReplyDraftStatus,
+    draft_path: Option<PathBuf>,
+    last_error: Option<String>,
 }
 
 impl ReplyPanelState {
@@ -989,9 +998,72 @@ impl ReplyPanelState {
             preview_confirmed: false,
             preview_confirmed_at: None,
             reply_notice: None,
+            draft_status: ReplyDraftStatus::Draft,
+            draft_path: None,
+            last_error: None,
         };
         state.clamp_cursor();
         state
+    }
+
+    fn from_draft(draft: ReplyDraft, self_addresses: Vec<String>) -> Self {
+        let mut state = Self {
+            thread_id: draft.thread_id,
+            mail_id: draft.mail_id,
+            from: draft.from_addr,
+            to: draft.to_addrs,
+            cc: draft.cc_addrs,
+            subject: draft.subject,
+            in_reply_to: draft.in_reply_to,
+            references: draft.references,
+            body: if draft.body.is_empty() {
+                vec![String::new()]
+            } else {
+                draft.body
+            },
+            self_addresses,
+            mode: ReplyEditMode::Normal,
+            section: ReplySection::From,
+            body_row: 0,
+            cursor_col: 0,
+            dirty: false,
+            scroll: 0,
+            command_input: String::new(),
+            preview_open: false,
+            preview_scroll: 0,
+            preview_rendered: String::new(),
+            preview_lines: Vec::new(),
+            preview_errors: Vec::new(),
+            preview_warnings: Vec::new(),
+            // A persisted preview confirmation must not authorize an
+            // unattended send after a restart; the user reviews it again.
+            preview_confirmed: false,
+            preview_confirmed_at: None,
+            reply_notice: None,
+            draft_status: draft.status,
+            draft_path: draft.draft_path,
+            last_error: draft.last_error,
+        };
+        state.clamp_cursor();
+        state
+    }
+
+    fn to_draft_request(&self) -> ReplyDraftRequest {
+        ReplyDraftRequest {
+            thread_id: self.thread_id,
+            mail_id: self.mail_id,
+            from_addr: self.from.clone(),
+            to_addrs: self.to.clone(),
+            cc_addrs: self.cc.clone(),
+            subject: self.subject.clone(),
+            in_reply_to: self.in_reply_to.clone(),
+            references: self.references.clone(),
+            body: self.body.clone(),
+            preview_confirmed_at: self.preview_confirmed_at.clone(),
+            status: self.draft_status,
+            draft_path: self.draft_path.clone(),
+            last_error: self.last_error.clone(),
+        }
     }
 
     fn mark_dirty(&mut self) {
@@ -999,6 +1071,9 @@ impl ReplyPanelState {
         self.preview_confirmed = false;
         self.preview_confirmed_at = None;
         self.reply_notice = None;
+        self.draft_status = ReplyDraftStatus::Draft;
+        self.draft_path = None;
+        self.last_error = None;
     }
 
     fn current_value(&self) -> &str {
@@ -3467,22 +3542,93 @@ impl AppState {
             self_addresses.push(email.clone());
         }
 
-        let seed = build_reply_seed(&raw, &thread, &identity, &self_addresses);
-        self.reply_panel = Some(ReplyPanelState::new(
-            seed,
-            self_addresses,
-            thread.mail_id,
-            thread.thread_id,
-        ));
-        self.status = format!(
-            "reply panel opened for <{}>; edit From/To/Cc/Subject before Send Preview",
-            thread.message_id
-        );
+        let draft = if self.runtime.database_path.exists() {
+            match reply_store::load_reply_draft(
+                &self.runtime.database_path,
+                thread.thread_id,
+                thread.mail_id,
+            ) {
+                Ok(draft) => draft,
+                Err(error) => {
+                    tracing::warn!(
+                        thread_id = thread.thread_id,
+                        mail_id = thread.mail_id,
+                        error = %error,
+                        "failed to restore reply draft; using a fresh seed"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let restored = draft.is_some();
+        let panel = if let Some(draft) = draft {
+            ReplyPanelState::from_draft(draft, self_addresses)
+        } else {
+            let seed = build_reply_seed(&raw, &thread, &identity, &self_addresses);
+            ReplyPanelState::new(seed, self_addresses, thread.mail_id, thread.thread_id)
+        };
+        self.reply_panel = Some(panel);
+        self.persist_reply_draft();
+        self.status = if restored {
+            format!(
+                "reply draft restored for <{}>; review it before Send Preview",
+                thread.message_id
+            )
+        } else {
+            format!(
+                "reply panel opened for <{}>; edit From/To/Cc/Subject before Send Preview",
+                thread.message_id
+            )
+        };
     }
 
     fn close_reply_panel(&mut self, status: impl Into<String>) {
+        self.persist_reply_draft();
         self.reply_panel = None;
         self.status = status.into();
+    }
+
+    fn discard_reply_panel(&mut self, status: impl Into<String>) {
+        if let Some(panel) = self.reply_panel.as_ref()
+            && self.runtime.database_path.exists()
+            && let Err(error) = reply_store::delete_reply_draft(
+                &self.runtime.database_path,
+                panel.thread_id,
+                panel.mail_id,
+            )
+        {
+            tracing::warn!(
+                thread_id = panel.thread_id,
+                mail_id = panel.mail_id,
+                error = %error,
+                "failed to delete reply draft"
+            );
+        }
+        self.reply_panel = None;
+        self.status = status.into();
+    }
+
+    fn persist_reply_draft(&mut self) {
+        let Some(panel) = self.reply_panel.as_ref() else {
+            return;
+        };
+        if !self.runtime.database_path.exists() {
+            // Unit-test runtimes and pre-bootstrap callers may not have a DB;
+            // the live TUI always runs after bootstrap creates it.
+            return;
+        }
+        if let Err(error) =
+            reply_store::upsert_reply_draft(&self.runtime.database_path, &panel.to_draft_request())
+        {
+            tracing::warn!(
+                thread_id = panel.thread_id,
+                mail_id = panel.mail_id,
+                error = %error,
+                "failed to persist reply draft"
+            );
+        }
     }
 
     fn open_reply_notice(
@@ -3652,7 +3798,7 @@ impl AppState {
                 } else {
                     format!("reply sent as <{}>", outcome.message_id)
                 };
-                self.close_reply_panel(status);
+                self.discard_reply_panel(status);
             }
             SendStatus::Failed | SendStatus::TimedOut => {
                 let summary = outcome
@@ -3670,6 +3816,11 @@ impl AppState {
                     error = %summary,
                     "reply send failed"
                 );
+                if let Some(panel) = self.reply_panel.as_mut() {
+                    panel.draft_status = ReplyDraftStatus::Failed;
+                    panel.draft_path = outcome.draft_path.clone();
+                    panel.last_error = outcome.error_summary.clone();
+                }
                 self.status = if let Err(error) = persist_result {
                     format!(
                         "send failed: {}; retry with S after fixing the issue (persist failed: {})",
@@ -3702,7 +3853,7 @@ impl AppState {
         }
 
         match command.as_str() {
-            "q!" => self.close_reply_panel("discarded reply draft"),
+            "q!" => self.discard_reply_panel("discarded reply draft"),
             "q" => {
                 if self.reply_panel.as_ref().is_some_and(|panel| panel.dirty) {
                     self.status = "unsaved reply draft, run :q! to discard".to_string();
@@ -3819,6 +3970,33 @@ impl AppState {
             Err(error) => {
                 tracing::error!(op = "patch.preflight", status = "failed", error = %error);
                 self.status = format!("preflight failed: {error}");
+            }
+        }
+    }
+
+    fn show_reply_outbox(&mut self) {
+        if !self.runtime.database_path.exists() {
+            self.status = "reply outbox is unavailable before database bootstrap".to_string();
+            return;
+        }
+        match reply_store::list_reply_outbox(&self.runtime.database_path) {
+            Ok(entries) if entries.is_empty() => {
+                self.status = "reply outbox is empty".to_string();
+            }
+            Ok(entries) => {
+                let failed = entries
+                    .iter()
+                    .filter(|entry| entry.status == ReplyDraftStatus::Failed)
+                    .count();
+                self.status = format!(
+                    "reply outbox: {} pending ({} failed; reopen the mail to retry)",
+                    entries.len(),
+                    failed
+                );
+            }
+            Err(error) => {
+                tracing::error!(op = "reply.outbox", status = "failed", error = %error);
+                self.status = format!("reply outbox failed: {error}");
             }
         }
     }

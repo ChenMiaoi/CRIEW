@@ -10,6 +10,78 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyDraftStatus {
+    Draft,
+    Failed,
+}
+
+impl ReplyDraftStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "failed" => Self::Failed,
+            _ => Self::Draft,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplyDraftRequest {
+    pub thread_id: i64,
+    pub mail_id: i64,
+    pub from_addr: String,
+    pub to_addrs: String,
+    pub cc_addrs: String,
+    pub subject: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
+    pub body: Vec<String>,
+    pub preview_confirmed_at: Option<String>,
+    pub status: ReplyDraftStatus,
+    pub draft_path: Option<PathBuf>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ReplyDraft {
+    pub id: i64,
+    pub thread_id: i64,
+    pub mail_id: i64,
+    pub from_addr: String,
+    pub to_addrs: String,
+    pub cc_addrs: String,
+    pub subject: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
+    pub body: Vec<String>,
+    pub preview_confirmed_at: Option<String>,
+    pub status: ReplyDraftStatus,
+    pub draft_path: Option<PathBuf>,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplyOutboxEntry {
+    pub id: i64,
+    pub thread_id: i64,
+    pub mail_id: i64,
+    pub subject: String,
+    pub to_addrs: String,
+    pub status: ReplyDraftStatus,
+    pub draft_path: Option<PathBuf>,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplySendStatus {
     Sent,
     Failed,
@@ -81,6 +153,164 @@ pub struct ReplySendRecord {
     pub stderr: Option<String>,
     pub started_at: String,
     pub finished_at: String,
+}
+
+pub fn upsert_reply_draft(path: &Path, request: &ReplyDraftRequest) -> Result<i64> {
+    let connection = open_connection(path)?;
+    let references = request.references.join("\n");
+    let body = request.body.join("\n");
+    let draft_path = request
+        .draft_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+
+    connection
+        .execute(
+            "
+INSERT INTO reply_draft(
+    thread_id, mail_id, from_addr, to_addrs, cc_addrs, subject, in_reply_to,
+    references_text, body, preview_confirmed_at, status, draft_path, last_error, updated_at
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+ON CONFLICT(thread_id, mail_id) DO UPDATE SET
+    from_addr = excluded.from_addr,
+    to_addrs = excluded.to_addrs,
+    cc_addrs = excluded.cc_addrs,
+    subject = excluded.subject,
+    in_reply_to = excluded.in_reply_to,
+    references_text = excluded.references_text,
+    body = excluded.body,
+    preview_confirmed_at = excluded.preview_confirmed_at,
+    status = excluded.status,
+    draft_path = excluded.draft_path,
+    last_error = excluded.last_error,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+",
+            params![
+                request.thread_id,
+                request.mail_id,
+                request.from_addr,
+                request.to_addrs,
+                request.cc_addrs,
+                request.subject,
+                request.in_reply_to,
+                references,
+                body,
+                request.preview_confirmed_at,
+                request.status.as_str(),
+                draft_path,
+                request.last_error,
+            ],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!(
+                    "failed to persist reply draft for mail {} thread {}",
+                    request.mail_id, request.thread_id
+                ),
+                error,
+            )
+        })?;
+
+    Ok(connection.last_insert_rowid())
+}
+
+pub fn load_reply_draft(path: &Path, thread_id: i64, mail_id: i64) -> Result<Option<ReplyDraft>> {
+    let connection = open_connection(path)?;
+    connection
+        .query_row(
+            "
+SELECT
+    id, thread_id, mail_id, from_addr, to_addrs, cc_addrs, subject, in_reply_to,
+    references_text, body, preview_confirmed_at, status, draft_path, last_error, updated_at
+FROM reply_draft
+WHERE thread_id = ?1 AND mail_id = ?2
+LIMIT 1
+",
+            params![thread_id, mail_id],
+            map_reply_draft,
+        )
+        .optional()
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!(
+                    "failed to load reply draft for mail {} thread {}",
+                    mail_id, thread_id
+                ),
+                error,
+            )
+        })
+}
+
+pub fn delete_reply_draft(path: &Path, thread_id: i64, mail_id: i64) -> Result<()> {
+    let connection = open_connection(path)?;
+    connection
+        .execute(
+            "DELETE FROM reply_draft WHERE thread_id = ?1 AND mail_id = ?2",
+            params![thread_id, mail_id],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!(
+                    "failed to delete reply draft for mail {} thread {}",
+                    mail_id, thread_id
+                ),
+                error,
+            )
+        })?;
+    Ok(())
+}
+
+pub fn list_reply_outbox(path: &Path) -> Result<Vec<ReplyOutboxEntry>> {
+    let connection = open_connection(path)?;
+    let mut statement = connection
+        .prepare(
+            "
+SELECT id, thread_id, mail_id, subject, to_addrs, status, draft_path, last_error, updated_at
+FROM reply_draft
+WHERE status IN ('draft', 'failed')
+ORDER BY updated_at DESC, id DESC
+",
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to prepare reply outbox query",
+                error,
+            )
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ReplyOutboxEntry {
+                id: row.get::<_, i64>(0)?,
+                thread_id: row.get::<_, i64>(1)?,
+                mail_id: row.get::<_, i64>(2)?,
+                subject: row.get::<_, String>(3)?,
+                to_addrs: row.get::<_, String>(4)?,
+                status: ReplyDraftStatus::from_db(&row.get::<_, String>(5)?),
+                draft_path: row.get::<_, Option<String>>(6)?.map(PathBuf::from),
+                last_error: row.get::<_, Option<String>>(7)?,
+                updated_at: row.get::<_, String>(8)?,
+            })
+        })
+        .map_err(|error| {
+            CriewError::with_source(ErrorCode::Database, "failed to query reply outbox", error)
+        })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row.map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to decode reply outbox entry",
+                error,
+            )
+        })?);
+    }
+    Ok(entries)
 }
 
 pub fn insert_reply_send(path: &Path, request: &ReplySendRecordRequest) -> Result<i64> {
@@ -191,6 +421,38 @@ LIMIT 1
         })
 }
 
+fn map_reply_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplyDraft> {
+    let references = row
+        .get::<_, String>(8)?
+        .lines()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    let body_text = row.get::<_, String>(9)?;
+    let body = if body_text.is_empty() {
+        vec![String::new()]
+    } else {
+        body_text.split('\n').map(ToOwned::to_owned).collect()
+    };
+    Ok(ReplyDraft {
+        id: row.get::<_, i64>(0)?,
+        thread_id: row.get::<_, i64>(1)?,
+        mail_id: row.get::<_, i64>(2)?,
+        from_addr: row.get::<_, String>(3)?,
+        to_addrs: row.get::<_, String>(4)?,
+        cc_addrs: row.get::<_, String>(5)?,
+        subject: row.get::<_, String>(6)?,
+        in_reply_to: row.get::<_, String>(7)?,
+        references,
+        body,
+        preview_confirmed_at: row.get::<_, Option<String>>(10)?,
+        status: ReplyDraftStatus::from_db(&row.get::<_, String>(11)?),
+        draft_path: row.get::<_, Option<String>>(12)?.map(PathBuf::from),
+        last_error: row.get::<_, Option<String>>(13)?,
+        updated_at: row.get::<_, String>(14)?,
+    })
+}
+
 fn open_connection(path: &Path) -> Result<Connection> {
     Connection::open(path).map_err(|error| {
         CriewError::with_source(
@@ -216,7 +478,9 @@ mod tests {
     use crate::infra::db;
 
     use super::{
-        ReplySendRecordRequest, ReplySendStatus, insert_reply_send, latest_reply_send_for_mail,
+        ReplyDraftRequest, ReplyDraftStatus, ReplySendRecordRequest, ReplySendStatus,
+        delete_reply_draft, insert_reply_send, latest_reply_send_for_mail, list_reply_outbox,
+        load_reply_draft, upsert_reply_draft,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -285,6 +549,79 @@ mod tests {
             Some("git send-email /tmp/reply.eml")
         );
         assert_eq!(record.draft_path, Some(PathBuf::from("/tmp/reply.eml")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persists_updates_lists_and_deletes_reply_draft() {
+        let root = temp_dir("draft");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+        let connection = Connection::open(&db_path).expect("open db");
+        connection
+            .execute(
+                "INSERT INTO mail(id, message_id, subject, from_addr) VALUES (11, 'patch@example.com', '[PATCH] demo', 'tester@example.com')",
+                [],
+            )
+            .expect("insert mail");
+        connection
+            .execute(
+                "INSERT INTO thread(id, root_mail_id, subject_norm, message_count) VALUES (7, 11, '[patch] demo', 1)",
+                [],
+            )
+            .expect("insert thread");
+
+        let request = ReplyDraftRequest {
+            thread_id: 7,
+            mail_id: 11,
+            from_addr: "Tester <tester@example.com>".to_string(),
+            to_addrs: "maintainer@example.com".to_string(),
+            cc_addrs: "list@example.com".to_string(),
+            subject: "Re: [PATCH] demo".to_string(),
+            in_reply_to: "patch@example.com".to_string(),
+            references: vec![
+                "patch@example.com".to_string(),
+                "root@example.com".to_string(),
+            ],
+            body: vec!["Looks good".to_string(), String::new()],
+            preview_confirmed_at: None,
+            status: ReplyDraftStatus::Draft,
+            draft_path: None,
+            last_error: None,
+        };
+        upsert_reply_draft(&db_path, &request).expect("persist draft");
+
+        let loaded = load_reply_draft(&db_path, 7, 11)
+            .expect("load draft")
+            .expect("draft exists");
+        assert_eq!(loaded.references, request.references);
+        assert_eq!(loaded.body, request.body);
+        assert_eq!(loaded.status, ReplyDraftStatus::Draft);
+
+        let mut failed = request.clone();
+        failed.status = ReplyDraftStatus::Failed;
+        failed.last_error = Some("smtp auth failed".to_string());
+        failed.draft_path = Some(PathBuf::from("/tmp/reply.eml"));
+        upsert_reply_draft(&db_path, &failed).expect("update draft failure");
+
+        let outbox = list_reply_outbox(&db_path).expect("list outbox");
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].status, ReplyDraftStatus::Failed);
+        assert_eq!(outbox[0].last_error.as_deref(), Some("smtp auth failed"));
+        assert_eq!(outbox[0].draft_path, Some(PathBuf::from("/tmp/reply.eml")));
+
+        delete_reply_draft(&db_path, 7, 11).expect("delete draft");
+        assert!(
+            load_reply_draft(&db_path, 7, 11)
+                .expect("load deleted draft")
+                .is_none()
+        );
+        assert!(
+            list_reply_outbox(&db_path)
+                .expect("list empty outbox")
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(root);
     }

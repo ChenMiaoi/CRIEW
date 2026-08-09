@@ -25,7 +25,7 @@ use crate::infra::db;
 use crate::infra::db::DatabaseState;
 use crate::infra::mail_parser;
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch, ThreadRow};
-use crate::infra::reply_store::{self, ReplySendStatus};
+use crate::infra::reply_store::{self, ReplyDraftRequest, ReplyDraftStatus, ReplySendStatus};
 use crate::infra::sendmail::{SendOutcome, SendRequest, SendStatus};
 use crate::infra::ui_state::{self, UiState};
 
@@ -649,12 +649,13 @@ fn empty_query_returns_all_palette_commands() {
     assert_eq!(all[2].name, "fetch-thread");
     assert_eq!(all[3].name, "help");
     assert_eq!(all[4].name, "keymap");
-    assert_eq!(all[5].name, "preflight");
-    assert_eq!(all[6].name, "quit");
-    assert_eq!(all[7].name, "restart");
-    assert_eq!(all[8].name, "review-inbox");
-    assert_eq!(all[9].name, "sync");
-    assert_eq!(all[10].name, "vim");
+    assert_eq!(all[5].name, "outbox");
+    assert_eq!(all[6].name, "preflight");
+    assert_eq!(all[7].name, "quit");
+    assert_eq!(all[8].name, "restart");
+    assert_eq!(all[9].name, "review-inbox");
+    assert_eq!(all[10].name, "sync");
+    assert_eq!(all[11].name, "vim");
 }
 
 #[test]
@@ -891,6 +892,8 @@ fn command_palette_help_includes_keyboard_shortcuts() {
     assert!(state.status.contains("y/n enable"));
     assert!(state.status.contains("a apply"));
     assert!(state.status.contains("d download"));
+    assert!(state.status.contains("P preflight"));
+    assert!(state.status.contains("outbox"));
     assert!(state.status.contains("u undo apply"));
 }
 
@@ -5239,6 +5242,16 @@ fn reply_send_failure_keeps_panel_open_and_persists_failure() {
     assert_eq!(record.message_id, "failed@example.com");
     assert_eq!(record.error_summary.as_deref(), Some("smtp auth failed"));
 
+    let draft = reply_store::load_reply_draft(&runtime.database_path, 1, 1)
+        .expect("load failed reply draft")
+        .expect("failed reply draft should remain in outbox");
+    assert_eq!(draft.status, ReplyDraftStatus::Failed);
+    assert_eq!(draft.last_error.as_deref(), Some("smtp auth failed"));
+    assert_eq!(
+        draft.draft_path,
+        Some(PathBuf::from("/tmp/reply-failed.eml"))
+    );
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -5531,6 +5544,81 @@ fn mail_page_r_opens_reply_panel_from_threads_focus() {
             .status
             .contains("reply panel opened for <patch@example.com>")
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_panel_restores_persisted_draft_and_outbox_command_lists_it() {
+    let root = temp_dir("reply-draft-restore");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+    let runtime = test_runtime_in(root.clone());
+    seed_mailbox_thread(
+        &runtime.database_path,
+        "inbox",
+        1,
+        "patch@example.com",
+        "[PATCH] demo",
+    );
+    reply_store::upsert_reply_draft(
+        &runtime.database_path,
+        &ReplyDraftRequest {
+            thread_id: 1,
+            mail_id: 1,
+            from_addr: "CRIEW Test <criew@example.com>".to_string(),
+            to_addrs: "Maintainer <maintainer@example.com>".to_string(),
+            cc_addrs: "List <list@example.com>".to_string(),
+            subject: "Re: [PATCH] demo".to_string(),
+            in_reply_to: "patch@example.com".to_string(),
+            references: vec!["patch@example.com".to_string()],
+            body: vec!["Persisted reply".to_string(), String::new()],
+            preview_confirmed_at: Some("2026-03-07T10:00:00Z".to_string()),
+            status: ReplyDraftStatus::Failed,
+            draft_path: Some(root.join("reply.eml")),
+            last_error: Some("smtp auth failed".to_string()),
+        },
+    )
+    .expect("persist draft");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw,
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let panel = state.reply_panel.as_ref().expect("reply panel should open");
+    assert_eq!(panel.to, "Maintainer <maintainer@example.com>");
+    assert_eq!(
+        panel.body,
+        vec!["Persisted reply".to_string(), String::new()]
+    );
+    assert!(!panel.preview_confirmed);
+    assert_eq!(panel.draft_status, ReplyDraftStatus::Failed);
+
+    state.reply_panel = None;
+    state.palette.open = true;
+    state.palette.input = "outbox".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.status.contains("reply outbox: 1 pending"));
+    assert!(state.status.contains("1 failed"));
 
     let _ = fs::remove_dir_all(root);
 }

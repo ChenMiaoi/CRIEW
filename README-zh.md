@@ -30,6 +30,8 @@ criew fetch-thread --mailbox io-uring '<reply@example.com>'
 criew review-inbox --mailbox io-uring
 # 在应用前运行 checkpatch.pl 和 get_maintainer.pl。
 criew preflight --mailbox io-uring '<patch@example.com>'
+# 列出可恢复的草稿和失败回信。
+criew outbox
 criew tui
 ```
 
@@ -47,6 +49,10 @@ criew tui
 `scripts/checkpatch.pl` 和 `scripts/get_maintainer.pl`，并把结果写入 patch
 运行历史。TUI 在线程列表选中 patch series 后按 `P`，或在命令栏输入
 `preflight`，可以执行同一项检查。
+
+Reply Panel 打开后会把草稿保存到 SQLite；`git send-email` 失败时会保留可编辑
+草稿、失败原因和 draft 文件。修复凭据或发送链路后，重新打开同一封邮件即可重试；
+`criew outbox` 或 TUI 命令栏的 `outbox` 会列出待处理草稿和失败回信。
 
 GitHub Releases 会发布源码包、
 独立二进制文件、

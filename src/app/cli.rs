@@ -80,6 +80,8 @@ pub enum Command {
         #[arg(value_name = "MESSAGE_ID")]
         message_id: String,
     },
+    /// List persisted reply drafts and failed sends waiting in the outbox.
+    Outbox,
     /// Run environment diagnostics.
     Doctor,
     /// Update CRIEW from crates.io using cargo install.
@@ -153,5 +155,11 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn outbox_parses_without_arguments() {
+        let cli = Cli::try_parse_from(["criew", "outbox"]).expect("parse outbox command");
+        assert!(matches!(cli.command, Some(Command::Outbox)));
     }
 }

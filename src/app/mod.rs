@@ -139,6 +139,11 @@ pub fn run() -> Result<()> {
                 Err(CriewError::new(ErrorCode::Command, result.summary))
             }
         }
+        cli::Command::Outbox => {
+            let entries = crate::infra::reply_store::list_reply_outbox(&runtime.database_path)?;
+            println!("{}", format_outbox_report(&entries));
+            Ok(())
+        }
         cli::Command::Doctor => {
             let b4_status = b4::check(runtime.b4_path.as_deref(), Some(&runtime.data_dir));
             let send_email_status = sendmail::check();
@@ -446,6 +451,34 @@ fn format_update_summary(summary: &update::UpdateSummary) -> String {
     )
 }
 
+fn format_outbox_report(entries: &[crate::infra::reply_store::ReplyOutboxEntry]) -> String {
+    let mut lines = vec![format!("reply outbox: {} pending", entries.len())];
+    for entry in entries {
+        let recipient = if entry.to_addrs.trim().is_empty() {
+            "<no recipient>"
+        } else {
+            entry.to_addrs.as_str()
+        };
+        lines.push(format!(
+            "  #{} thread={} mail={} status={} updated={} to={} subject={}",
+            entry.id,
+            entry.thread_id,
+            entry.mail_id,
+            entry.status.as_str(),
+            entry.updated_at,
+            recipient,
+            entry.subject
+        ));
+        if let Some(error) = entry.last_error.as_deref() {
+            lines.push(format!("    error: {error}"));
+        }
+        if let Some(path) = entry.draft_path.as_deref() {
+            lines.push(format!("    draft: {}", path.display()));
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -458,13 +491,14 @@ mod tests {
     };
     use crate::infra::db::DatabaseState;
     use crate::infra::imap::MailboxSnapshot;
+    use crate::infra::reply_store::{ReplyDraftStatus, ReplyOutboxEntry};
     use crate::infra::sendmail::{
         GitSendEmailCheck, GitSendEmailStatus, ReplyIdentity, ReplyIdentitySource,
     };
 
     use super::{
-        DoctorImapStatus, build_sync_request, format_doctor_report, format_sync_summary,
-        format_update_summary, probe_doctor_imap,
+        DoctorImapStatus, build_sync_request, format_doctor_report, format_outbox_report,
+        format_sync_summary, format_update_summary, probe_doctor_imap,
     };
 
     fn test_runtime() -> RuntimeConfig {
@@ -548,6 +582,26 @@ mod tests {
         assert!(rendered.contains("mailbox=linux-kernel"));
         assert!(rendered.contains("source=fixture"));
         assert!(rendered.contains("synced_at=<unknown>"));
+    }
+
+    #[test]
+    fn format_outbox_report_includes_failure_and_draft_path() {
+        let report = format_outbox_report(&[ReplyOutboxEntry {
+            id: 3,
+            thread_id: 7,
+            mail_id: 11,
+            subject: "Re: [PATCH] demo".to_string(),
+            to_addrs: "maintainer@example.com".to_string(),
+            status: ReplyDraftStatus::Failed,
+            draft_path: Some(PathBuf::from("/tmp/reply.eml")),
+            last_error: Some("smtp auth failed".to_string()),
+            updated_at: "2026-03-07T10:00:00Z".to_string(),
+        }]);
+
+        assert!(report.contains("reply outbox: 1 pending"));
+        assert!(report.contains("status=failed"));
+        assert!(report.contains("error: smtp auth failed"));
+        assert!(report.contains("draft: /tmp/reply.eml"));
     }
 
     #[test]

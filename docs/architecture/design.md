@@ -333,7 +333,7 @@ MVP 范围与阶段目标已迁移至独立文档：
 ### 14.1 已决策项
 
 - 工程结构采用四层模块：`app` / `domain` / `infra` / `ui`。
-- CLI 命令固定为：`tui`、`sync`、`fetch-thread`、`review-inbox`、`preflight`、`doctor`、`version`。
+- CLI 命令固定为：`tui`、`sync`、`fetch-thread`、`review-inbox`、`preflight`、`outbox`、`doctor`、`version`。
 - 配置读取采用 TOML，支持 `--config` 路径覆盖和默认目录策略。
 - 启动阶段统一执行目录引导与 SQLite 初始化迁移，`schema_version` 作为版本入口。
 - b4 检查顺序固定：配置路径 -> `CRIEW_B4_PATH` -> `vendor/b4/b4.sh` -> `PATH` 中 `b4`。
@@ -447,8 +447,8 @@ MVP 范围与阶段目标已迁移至独立文档：
 
 ### 18.2 风险与后续动作
 
-- 当前 reply draft 仅保存在内存中，关闭面板或退出 TUI 后不会恢复；若 M8 引入发送重试/
-  草稿保留，需要补充持久化策略。
+- M12 已将 reply draft 持久化到 `reply_draft`；M7 的编辑器仍不提供独立 compose/
+  forward 草稿，后续扩展需沿用同一状态模型。
 - 正文仍以纯文本单缓冲区编辑为主，尚未加入 72 列辅助换行、地址补全或 alias 管理；
   这些增强应在不破坏当前头部构造规则的前提下后续追加。
 
@@ -469,8 +469,8 @@ MVP 范围与阶段目标已迁移至独立文档：
 
 ### 19.2 风险与后续动作
 
-- 当前发送后只持久化审计结果，不持久化完整 draft 内容；若后续需要跨重启重试，
-  需补草稿存储与恢复策略。
+- M12 已补齐完整 draft 内容、失败状态和 outbox 路径；发送审计仍单独保存在
+  `reply_send`，两者按 thread/mail 关联。
 - MVP 仍依赖外部 `git send-email` 与用户本地 git mail 配置；后续在不改变 Reply Panel
   交互的前提下，可替换为 CRIEW 自实现 SMTP 发送器。
 
@@ -535,6 +535,26 @@ MVP 范围与阶段目标已迁移至独立文档：
   raw 邮件并保留原始输出，后续可增加 MIME/mbox 归一化和按文件的结果分组。
 - `get_maintainer.pl` 依赖 kernel tree 的路径与 git 元数据；未配置 tree 时只报告
   checker 缺失，不伪造维护者列表。
+
+## 23. M12（已完成）：持久化 Reply Draft 与 Outbox
+
+### 23.1 已决策项
+
+- 新增 `reply_draft` 表，以 `(thread_id, mail_id)` 保持一个可恢复草稿；Reply Panel
+  打开、编辑和关闭时保存 From/To/Cc/Subject、`In-Reply-To`、References、正文、
+  draft 文件路径和最新错误。
+- 发送失败或超时会把草稿状态设为 `failed`，保留 `git send-email` 生成的 outbox 文件
+  和错误摘要；重新打开同一封邮件会恢复草稿，仍要求重新执行 Send Preview 确认，避免
+  重启后误发。发送成功或显式 `q!` 丢弃时删除对应草稿。
+- 新增 `outbox` CLI 与 TUI 命令，按更新时间列出 `draft`/`failed` 项；详细字段和
+  失败原因来自同一 SQLite 记录，CLI 可用于无 TUI 环境下的恢复检查。
+
+### 23.2 风险与后续动作
+
+- 当前以单个 thread/mail 对应一个草稿，尚未提供独立 compose thread；后续 compose/
+  forward 需要先定义无源邮件的 thread/mail 关联和发送审计语义。
+- 草稿保存发生在 TUI 事件边界，异常退出前最后一个未完成事件仍可能丢失；后续可增加
+  定时 checkpoint 或显式 `:write`，但必须避免每个字符触发过多 SQLite 写入。
 
 ---
 
