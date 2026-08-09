@@ -52,7 +52,9 @@ criew tui
 
 Reply Panel 打开后会把草稿保存到 SQLite；`git send-email` 失败时会保留可编辑
 草稿、失败原因和 draft 文件。修复凭据或发送链路后，重新打开同一封邮件即可重试；
-`criew outbox` 或 TUI 命令栏的 `outbox` 会列出待处理草稿和失败回信。
+`criew outbox` 或 TUI 命令栏的 `outbox` 会列出待处理草稿和失败回信。TUI 中按
+`C` 可新建独立邮件，按 `f` 转发当前邮件，输入 `outbox DRAFT_ID` 可直接恢复任意草稿，
+不必先回到原邮箱行。
 
 GitHub Releases 会发布源码包、
 独立二进制文件、

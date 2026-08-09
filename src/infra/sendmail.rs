@@ -694,7 +694,9 @@ fn render_message_file(request: &SendRequest, message_id: &str) -> String {
     lines.push(format!("Subject: {}", request.subject));
     lines.push(format!("Date: {}", Utc::now().to_rfc2822()));
     lines.push(format!("Message-ID: <{message_id}>"));
-    lines.push(format!("In-Reply-To: <{}>", request.in_reply_to));
+    if !request.in_reply_to.trim().is_empty() {
+        lines.push(format!("In-Reply-To: <{}>", request.in_reply_to));
+    }
     if !request.references.is_empty() {
         lines.push(format!(
             "References: {}",
@@ -724,9 +726,11 @@ fn build_send_email_args(request: &SendRequest, draft_path: &Path) -> Vec<String
         request.from.clone(),
         "--subject".to_string(),
         request.subject.clone(),
-        "--in-reply-to".to_string(),
-        format!("<{}>", request.in_reply_to),
     ];
+    if !request.in_reply_to.trim().is_empty() {
+        args.push("--in-reply-to".to_string());
+        args.push(format!("<{}>", request.in_reply_to));
+    }
 
     for to in &request.to {
         args.push("--to".to_string());
@@ -852,11 +856,11 @@ mod tests {
     use crate::infra::config::RuntimeConfig;
 
     use super::{
-        GitSendEmailStatus, ReplyIdentitySource, SendRequest, SendStatus, check_with_command_path,
-        extract_email_address, generate_message_id, normalize_message_id, normalize_output,
-        render_command_line, render_message_file, resolve_reply_identity_with_command_path,
-        resolve_working_dir, send_with_command_path, send_with_options, stabilize_child_path,
-        summarize_failure,
+        GitSendEmailStatus, ReplyIdentitySource, SendRequest, SendStatus, build_send_email_args,
+        check_with_command_path, extract_email_address, generate_message_id, normalize_message_id,
+        normalize_output, render_command_line, render_message_file,
+        resolve_reply_identity_with_command_path, resolve_working_dir, send_with_command_path,
+        send_with_options, stabilize_child_path, summarize_failure,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1309,6 +1313,16 @@ mod tests {
         assert!(rendered.contains("In-Reply-To: <patch@example.com>"));
         assert!(rendered.contains("References: <older@example.com> <patch@example.com>"));
         assert!(rendered.ends_with("reply body\n"));
+
+        request.in_reply_to.clear();
+        request.references.clear();
+        let standalone = render_message_file(&request, "compose@example.com");
+        assert!(!standalone.contains("In-Reply-To:"));
+        assert!(
+            !build_send_email_args(&request, Path::new("/tmp/compose.eml"))
+                .iter()
+                .any(|arg| arg == "--in-reply-to")
+        );
 
         assert_eq!(
             render_command_line(

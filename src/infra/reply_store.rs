@@ -245,6 +245,93 @@ LIMIT 1
         })
 }
 
+pub fn load_reply_draft_by_id(path: &Path, draft_id: i64) -> Result<Option<ReplyDraft>> {
+    let connection = open_connection(path)?;
+    connection
+        .query_row(
+            "
+SELECT
+    id, thread_id, mail_id, from_addr, to_addrs, cc_addrs, subject, in_reply_to,
+    references_text, body, preview_confirmed_at, status, draft_path, last_error, updated_at
+FROM reply_draft
+WHERE id = ?1
+LIMIT 1
+",
+            params![draft_id],
+            map_reply_draft,
+        )
+        .optional()
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to load reply draft {draft_id}"),
+                error,
+            )
+        })
+}
+
+/// Create an invisible mail/thread pair for a standalone compose draft.
+///
+/// Reply drafts use the same foreign keys for replies and independent
+/// messages.  Keeping a synthetic anchor lets the outbox retain one stable
+/// identity without making the send-history schema nullable, while the NULL
+/// mailbox keeps the anchor out of normal mailbox thread lists.
+pub fn create_draft_anchor(
+    path: &Path,
+    message_id: &str,
+    subject: &str,
+    from_addr: &str,
+) -> Result<(i64, i64)> {
+    let mut connection = open_connection(path)?;
+    let transaction = connection.transaction().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to begin compose draft anchor transaction",
+            error,
+        )
+    })?;
+    transaction
+        .execute(
+            "
+INSERT INTO mail(message_id, subject, from_addr, imap_mailbox, is_expunged)
+VALUES (?1, ?2, ?3, NULL, 0)
+",
+            params![message_id, subject, from_addr],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to create compose mail anchor <{message_id}>"),
+                error,
+            )
+        })?;
+    let mail_id = transaction.last_insert_rowid();
+    transaction
+        .execute(
+            "
+INSERT INTO thread(root_mail_id, subject_norm, last_activity_at, message_count)
+VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1)
+",
+            params![mail_id, subject.trim().to_ascii_lowercase()],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to create compose thread anchor for mail {mail_id}"),
+                error,
+            )
+        })?;
+    let thread_id = transaction.last_insert_rowid();
+    transaction.commit().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            format!("failed to commit compose draft anchor for mail {mail_id}"),
+            error,
+        )
+    })?;
+    Ok((thread_id, mail_id))
+}
+
 pub fn delete_reply_draft(path: &Path, thread_id: i64, mail_id: i64) -> Result<()> {
     let connection = open_connection(path)?;
     connection
@@ -479,8 +566,8 @@ mod tests {
 
     use super::{
         ReplyDraftRequest, ReplyDraftStatus, ReplySendRecordRequest, ReplySendStatus,
-        delete_reply_draft, insert_reply_send, latest_reply_send_for_mail, list_reply_outbox,
-        load_reply_draft, upsert_reply_draft,
+        create_draft_anchor, delete_reply_draft, insert_reply_send, latest_reply_send_for_mail,
+        list_reply_outbox, load_reply_draft, load_reply_draft_by_id, upsert_reply_draft,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -622,6 +709,61 @@ mod tests {
                 .expect("list empty outbox")
                 .is_empty()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn creates_hidden_compose_anchor_and_loads_draft_by_id() {
+        let root = temp_dir("compose-anchor");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let (thread_id, mail_id) = create_draft_anchor(
+            &db_path,
+            "compose-test@example.com",
+            "Draft subject",
+            "Tester <tester@example.com>",
+        )
+        .expect("create compose anchor");
+        assert!(thread_id > 0);
+        assert!(mail_id > 0);
+
+        let draft_id = upsert_reply_draft(
+            &db_path,
+            &ReplyDraftRequest {
+                thread_id,
+                mail_id,
+                from_addr: "Tester <tester@example.com>".to_string(),
+                to_addrs: "recipient@example.com".to_string(),
+                cc_addrs: String::new(),
+                subject: "Draft subject".to_string(),
+                in_reply_to: String::new(),
+                references: Vec::new(),
+                body: vec!["body".to_string()],
+                preview_confirmed_at: None,
+                status: ReplyDraftStatus::Draft,
+                draft_path: None,
+                last_error: None,
+            },
+        )
+        .expect("persist compose draft");
+        let loaded = load_reply_draft_by_id(&db_path, draft_id)
+            .expect("load compose draft by id")
+            .expect("compose draft exists");
+        assert_eq!(loaded.thread_id, thread_id);
+        assert_eq!(loaded.mail_id, mail_id);
+        assert!(loaded.in_reply_to.is_empty());
+
+        let connection = Connection::open(&db_path).expect("open db");
+        let mailbox: Option<String> = connection
+            .query_row(
+                "SELECT imap_mailbox FROM mail WHERE id = ?1",
+                [mail_id],
+                |row| row.get(0),
+            )
+            .expect("load anchor mailbox");
+        assert!(mailbox.is_none());
 
         let _ = fs::remove_dir_all(root);
     }

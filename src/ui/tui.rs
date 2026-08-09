@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::app::cli::ReviewInboxMode;
 use crate::app::patch as patch_worker;
@@ -70,7 +70,7 @@ use render::{
 };
 use render::{draw, subscription_line};
 
-use preview::{MailPreview, load_mail_preview};
+use preview::{MailPreview, extract_mail_body_text, load_mail_preview};
 #[cfg(test)]
 use preview::{extract_mail_body_preview, extract_mail_preview};
 use reply::{
@@ -183,6 +183,10 @@ struct LastApplySnapshot {
 
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
+        name: "compose",
+        description: "Compose a new message",
+    },
+    PaletteCommand {
         name: "quit",
         description: "Exit CRIEW",
     },
@@ -205,6 +209,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "fetch-thread",
         description: "Fetch the complete thread for a Message-ID",
+    },
+    PaletteCommand {
+        name: "forward",
+        description: "Forward the selected message",
     },
     PaletteCommand {
         name: "review-inbox",
@@ -3584,6 +3592,198 @@ impl AppState {
         };
     }
 
+    fn reply_self_addresses(&self, identity: &ReplyIdentity) -> Vec<String> {
+        let mut self_addresses = vec![identity.email.clone()];
+        if let Some(email) = self.runtime.imap.email.as_ref() {
+            self_addresses.push(email.clone());
+        }
+        self_addresses
+    }
+
+    fn open_compose_panel(&mut self) {
+        if !matches!(self.ui_page, UiPage::Mail) {
+            self.status = "compose is only available on mail page".to_string();
+            return;
+        }
+        if !self.runtime.database_path.exists() {
+            self.status = "compose is unavailable before database bootstrap".to_string();
+            return;
+        }
+
+        let identity = match (self.reply_identity_resolver)() {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.status = format!("compose identity unavailable: {error}");
+                return;
+            }
+        };
+        let self_addresses = self.reply_self_addresses(&identity);
+        let message_id = standalone_draft_message_id();
+        let (thread_id, mail_id) = match reply_store::create_draft_anchor(
+            &self.runtime.database_path,
+            &message_id,
+            "",
+            &identity.display,
+        ) {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::error!(op = "reply.compose", status = "failed", error = %error);
+                self.status = format!("compose draft initialization failed: {error}");
+                return;
+            }
+        };
+        let panel = ReplyPanelState::new(
+            ReplySeed {
+                from: identity.display,
+                to: String::new(),
+                cc: String::new(),
+                subject: String::new(),
+                in_reply_to: String::new(),
+                references: Vec::new(),
+                body: vec![String::new()],
+            },
+            self_addresses,
+            mail_id,
+            thread_id,
+        );
+        self.reply_panel = Some(panel);
+        let draft_id = self.persist_reply_draft();
+        self.status = match draft_id {
+            Some(draft_id) => format!(
+                "compose panel opened; enter recipients and subject before Send Preview (draft #{draft_id})"
+            ),
+            None => {
+                "compose panel opened; enter recipients and subject before Send Preview".to_string()
+            }
+        };
+    }
+
+    fn open_forward_panel(&mut self) {
+        if !matches!(self.ui_page, UiPage::Mail) {
+            self.status = "forward is only available on mail page".to_string();
+            return;
+        }
+        let Some(thread) = self.selected_thread().cloned() else {
+            self.status = "select a mail thread before forwarding".to_string();
+            return;
+        };
+        let Some(raw_path) = thread.raw_path.clone() else {
+            self.status = "selected mail has no raw source; cannot build forward draft".to_string();
+            return;
+        };
+        if !self.runtime.database_path.exists() {
+            self.status = "forward is unavailable before database bootstrap".to_string();
+            return;
+        }
+        let raw = match fs::read(&raw_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.status = format!("failed to read {}: {}", raw_path.display(), error);
+                return;
+            }
+        };
+        let identity = match (self.reply_identity_resolver)() {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.status = format!("forward identity unavailable: {error}");
+                return;
+            }
+        };
+        let self_addresses = self.reply_self_addresses(&identity);
+        let mut body = vec![
+            "---------- Forwarded message ----------".to_string(),
+            format!("From: {}", thread.from_addr),
+            format!("Subject: {}", thread.subject),
+            String::new(),
+        ];
+        let forwarded = extract_mail_body_text(&raw);
+        if !forwarded.trim().is_empty() {
+            body.extend(forwarded.lines().map(ToOwned::to_owned));
+        }
+        let subject = if thread.subject.trim().is_empty() {
+            "Fwd: <no subject>".to_string()
+        } else {
+            format!("Fwd: {}", thread.subject.trim())
+        };
+        let panel = ReplyPanelState::new(
+            ReplySeed {
+                from: identity.display,
+                to: String::new(),
+                cc: String::new(),
+                subject,
+                in_reply_to: String::new(),
+                references: Vec::new(),
+                body,
+            },
+            self_addresses,
+            thread.mail_id,
+            thread.thread_id,
+        );
+        self.reply_panel = Some(panel);
+        self.persist_reply_draft();
+        self.status = format!(
+            "forward panel opened for <{}>; enter recipients before Send Preview",
+            thread.message_id
+        );
+    }
+
+    fn open_reply_draft_by_id(&mut self, draft_id: i64) {
+        if !matches!(self.ui_page, UiPage::Mail) {
+            self.status = "outbox drafts are only available on mail page".to_string();
+            return;
+        }
+        if !self.runtime.database_path.exists() {
+            self.status = "reply outbox is unavailable before database bootstrap".to_string();
+            return;
+        }
+        let draft = match reply_store::load_reply_draft_by_id(&self.runtime.database_path, draft_id)
+        {
+            Ok(Some(draft)) => draft,
+            Ok(None) => {
+                self.status = format!("reply draft #{draft_id} was not found");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(op = "reply.outbox.open", draft_id, error = %error);
+                self.status = format!("failed to load reply draft #{draft_id}: {error}");
+                return;
+            }
+        };
+        let identity = match (self.reply_identity_resolver)() {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.status = format!("reply identity unavailable: {error}");
+                return;
+            }
+        };
+        let self_addresses = self.reply_self_addresses(&identity);
+        self.reply_panel = Some(ReplyPanelState::from_draft(draft, self_addresses));
+        self.persist_reply_draft();
+        self.status = format!("reply draft #{draft_id} restored; review it before Send Preview");
+    }
+
+    fn handle_palette_outbox(&mut self, command: &str) {
+        let mut parts = command.split_whitespace();
+        let _ = parts.next();
+        let Some(value) = parts.next() else {
+            self.show_reply_outbox();
+            return;
+        };
+        if parts.next().is_some() {
+            self.status = "usage: outbox [DRAFT_ID]".to_string();
+            return;
+        }
+        let Ok(draft_id) = value.parse::<i64>() else {
+            self.status = "usage: outbox [DRAFT_ID]".to_string();
+            return;
+        };
+        if draft_id <= 0 {
+            self.status = "usage: outbox [DRAFT_ID]".to_string();
+            return;
+        }
+        self.open_reply_draft_by_id(draft_id);
+    }
+
     fn close_reply_panel(&mut self, status: impl Into<String>) {
         self.persist_reply_draft();
         self.reply_panel = None;
@@ -3610,24 +3810,27 @@ impl AppState {
         self.status = status.into();
     }
 
-    fn persist_reply_draft(&mut self) {
-        let Some(panel) = self.reply_panel.as_ref() else {
-            return;
-        };
+    fn persist_reply_draft(&mut self) -> Option<i64> {
+        let panel = self.reply_panel.as_ref()?;
         if !self.runtime.database_path.exists() {
             // Unit-test runtimes and pre-bootstrap callers may not have a DB;
             // the live TUI always runs after bootstrap creates it.
-            return;
+            return None;
         }
-        if let Err(error) =
-            reply_store::upsert_reply_draft(&self.runtime.database_path, &panel.to_draft_request())
-        {
-            tracing::warn!(
-                thread_id = panel.thread_id,
-                mail_id = panel.mail_id,
-                error = %error,
-                "failed to persist reply draft"
-            );
+        match reply_store::upsert_reply_draft(
+            &self.runtime.database_path,
+            &panel.to_draft_request(),
+        ) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::warn!(
+                    thread_id = panel.thread_id,
+                    mail_id = panel.mail_id,
+                    error = %error,
+                    "failed to persist reply draft"
+                );
+                None
+            }
         }
     }
 
@@ -3989,7 +4192,7 @@ impl AppState {
                     .filter(|entry| entry.status == ReplyDraftStatus::Failed)
                     .count();
                 self.status = format!(
-                    "reply outbox: {} pending ({} failed; reopen the mail to retry)",
+                    "reply outbox: {} pending ({} failed; use outbox ID to reopen)",
                     entries.len(),
                     failed
                 );
@@ -5366,6 +5569,14 @@ fn persist_reply_send_result(
 
 fn now_timestamp() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn standalone_draft_message_id() -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("compose-{}-{}@criew.local", std::process::id(), nonce)
 }
 
 fn reply_body_line_logical_row(body_row: usize) -> usize {

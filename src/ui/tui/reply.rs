@@ -222,18 +222,22 @@ pub(super) fn prepare_reply_message(
         errors.push("reply preview has no recipients after removing self".to_string());
     }
 
-    let subject = normalize_reply_subject(request.subject);
-    if subject == "Re:" {
+    let in_reply_to = normalize_message_id(request.in_reply_to);
+    let mut normalized_references =
+        normalize_message_ids(request.references.iter().map(String::as_str));
+    let independent_message = in_reply_to.is_empty() && normalized_references.is_empty();
+    let subject = if independent_message {
+        normalize_header_value(request.subject)
+    } else {
+        normalize_reply_subject(request.subject)
+    };
+    if subject.is_empty() || subject == "Re:" {
         errors.push("Subject is empty".to_string());
     }
 
-    let in_reply_to = normalize_message_id(request.in_reply_to);
-    if in_reply_to.is_empty() {
+    if in_reply_to.is_empty() && !independent_message {
         errors.push("In-Reply-To is missing".to_string());
     }
-
-    let mut normalized_references =
-        normalize_message_ids(request.references.iter().map(String::as_str));
     if normalized_references.is_empty() && !in_reply_to.is_empty() {
         normalized_references.push(in_reply_to.clone());
     }
@@ -867,6 +871,25 @@ mod tests {
     }
 
     #[test]
+    fn prepare_reply_message_allows_independent_compose_without_thread_headers() {
+        let (message, errors) = prepare_reply_message(ReplyPreviewRequest {
+            from: "CRIEW Test <criew@example.com>",
+            to: "Recipient <recipient@example.com>",
+            cc: "",
+            subject: "New message",
+            in_reply_to: "",
+            references: &[],
+            body: &["hello".to_string()],
+            self_addresses: &[identity().email.clone()],
+        });
+
+        assert!(errors.is_empty());
+        assert!(message.in_reply_to.is_empty());
+        assert!(message.references.is_empty());
+        assert_eq!(message.subject, "New message");
+    }
+
+    #[test]
     fn prepare_reply_message_adds_parent_to_existing_references_and_filters_self() {
         let (message, errors) = prepare_reply_message(ReplyPreviewRequest {
             from: " CRIEW Test <criew@example.com> ",
@@ -979,15 +1002,9 @@ mod tests {
                 .iter()
                 .any(|value| value == "Subject is empty")
         );
-        assert!(
-            preview
-                .errors
-                .iter()
-                .any(|value| value == "In-Reply-To is missing")
-        );
         assert!(preview.content.contains("To: <none>"));
         assert!(preview.content.contains("Cc: <none>"));
-        assert!(preview.content.contains("Subject: Re:"));
+        assert!(preview.content.contains("Subject: "));
         assert!(preview.content.contains("In-Reply-To: <none>"));
         assert!(preview.content.contains("References: <none>"));
         assert!(preview.content.ends_with("<empty body>"));

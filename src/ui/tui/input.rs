@@ -156,6 +156,14 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         {
             state.open_reply_panel(true);
         }
+        KeyCode::Char('C') if matches!(state.ui_page, UiPage::Mail) => {
+            state.open_compose_panel();
+        }
+        KeyCode::Char('f')
+            if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Threads) =>
+        {
+            state.open_forward_panel();
+        }
         KeyCode::Char(character)
             if matches!(state.ui_page, UiPage::Mail) && character.eq_ignore_ascii_case(&'r') =>
         {
@@ -637,7 +645,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "restart" => return LoopAction::Restart,
                 "help" => {
                     state.status = format!(
-                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, review-inbox [needs-review|reviewed|all|off], preflight, outbox, config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, P preflight, F fetch thread, u undo apply, e reply/inline edit, r reply, E external vim",
+                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, review-inbox [needs-review|reviewed|all|off], preflight, compose, forward, outbox [DRAFT_ID], config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, P preflight, F fetch thread, C compose, f forward, u undo apply, e reply/inline edit, r reply, E external vim",
                         main_page_focus_shortcuts(&state.main_page_keymap),
                         main_page_move_shortcuts(&state.main_page_keymap)
                     );
@@ -658,8 +666,24 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                     state.run_patch_preflight();
                     state.dismiss_palette();
                 }
-                "outbox" => {
-                    state.show_reply_outbox();
+                value if value.split_whitespace().next() == Some("compose") => {
+                    if value.split_whitespace().count() > 1 {
+                        state.status = "usage: compose".to_string();
+                    } else {
+                        state.open_compose_panel();
+                    }
+                    state.dismiss_palette();
+                }
+                value if value.split_whitespace().next() == Some("forward") => {
+                    if value.split_whitespace().count() > 1 {
+                        state.status = "usage: forward".to_string();
+                    } else {
+                        state.open_forward_panel();
+                    }
+                    state.dismiss_palette();
+                }
+                value if value.split_whitespace().next() == Some("outbox") => {
+                    state.handle_palette_outbox(&raw_command);
                     state.dismiss_palette();
                 }
                 value if value.split_whitespace().next() == Some("config") => {

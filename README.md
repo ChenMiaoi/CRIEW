@@ -57,7 +57,10 @@ as `P` on a selected patch series or `preflight` in the command palette.
 Reply drafts are saved in SQLite while the Reply Panel is open, and a failed
 `git send-email` keeps both the editable draft and failure details. Reopen the
 same mail to retry after fixing credentials or transport; `criew outbox` (or
-the TUI `outbox` command) lists pending drafts and failed sends.
+the TUI `outbox` command) lists pending drafts and failed sends. In the TUI,
+`C` starts an independent compose draft, `f` forwards the selected message,
+and `outbox DRAFT_ID` reopens any persisted draft without returning to its
+original mailbox row.
 
 GitHub Releases publish source archives,
 standalone binaries,

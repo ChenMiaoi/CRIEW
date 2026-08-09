@@ -266,7 +266,7 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
 - `a`: apply 当前 series
 - `r`: reply（非 Vim 回退入口）
 - `e`: 在 `Patch Preview` 进入 Vim，并自动弹出回信面板
-- `f`: 添加过滤条件
+- `f`: 转发当前选中邮件
 - `/`: 搜索
 
 状态反馈：
@@ -440,6 +440,9 @@ MVP 范围与阶段目标已迁移至独立文档：
   `In-Reply-To`、`References` 与 kernel 风格引用正文；`Subject` 固定规范为单一
   `Re: ...`，其中 `From/To/Cc/Subject` 只是可编辑的默认值，只有
   `In-Reply-To/References` 保持只读；`To/Cc` 在构造与预览阶段都会去重并移除自己地址。
+- 独立 compose 与 forward 复用同一 Reply Panel 状态模型：compose 从空收件人、主题和正文
+  开始，forward 预填 `Fwd: ...` 主题与原邮件正文；独立邮件不发送空的
+  `In-Reply-To`/`References` 头。
 - 回信编辑沿用 VM1 的最小 Vim-like 交互（`NORMAL / INSERT / COMMAND`），但作用域改为
   Reply draft：头部字段保持单行编辑，正文支持 `>` 引用续写。
 - `Send Preview -> Confirm` 在 M7 固化为强门控：任何 draft 变更都会清除确认状态，
@@ -447,8 +450,8 @@ MVP 范围与阶段目标已迁移至独立文档：
 
 ### 18.2 风险与后续动作
 
-- M12 已将 reply draft 持久化到 `reply_draft`；M7 的编辑器仍不提供独立 compose/
-  forward 草稿，后续扩展需沿用同一状态模型。
+- M12 已将 reply draft 持久化到 `reply_draft`；独立 compose/forward 也沿用该表，并以
+  隐藏的 mail/thread 锚点保持 outbox 恢复和发送审计所需的外键。
 - 正文仍以纯文本单缓冲区编辑为主，尚未加入 72 列辅助换行、地址补全或 alias 管理；
   这些增强应在不破坏当前头部构造规则的前提下后续追加。
 
@@ -551,8 +554,8 @@ MVP 范围与阶段目标已迁移至独立文档：
 
 ### 23.2 风险与后续动作
 
-- 当前以单个 thread/mail 对应一个草稿，尚未提供独立 compose thread；后续 compose/
-  forward 需要先定义无源邮件的 thread/mail 关联和发送审计语义。
+- 独立 compose 使用 NULL mailbox 的隐藏 mail/thread 锚点，因此不会出现在正常 mailbox
+  线程列表，但仍可通过 `outbox DRAFT_ID` 恢复并关联发送审计。
 - 草稿保存发生在 TUI 事件边界，异常退出前最后一个未完成事件仍可能丢失；后续可增加
   定时 checkpoint 或显式 `:write`，但必须避免每个字符触发过多 SQLite 写入。
 

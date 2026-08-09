@@ -644,18 +644,25 @@ fn type_text(state: &mut AppState, text: &str) {
 fn empty_query_returns_all_palette_commands() {
     let all = matching_commands("");
     assert_eq!(all.len(), PALETTE_COMMANDS.len());
-    assert_eq!(all[0].name, "config");
-    assert_eq!(all[1].name, "exit");
-    assert_eq!(all[2].name, "fetch-thread");
-    assert_eq!(all[3].name, "help");
-    assert_eq!(all[4].name, "keymap");
-    assert_eq!(all[5].name, "outbox");
-    assert_eq!(all[6].name, "preflight");
-    assert_eq!(all[7].name, "quit");
-    assert_eq!(all[8].name, "restart");
-    assert_eq!(all[9].name, "review-inbox");
-    assert_eq!(all[10].name, "sync");
-    assert_eq!(all[11].name, "vim");
+    assert_eq!(
+        all.iter().map(|command| command.name).collect::<Vec<_>>(),
+        vec![
+            "compose",
+            "config",
+            "exit",
+            "fetch-thread",
+            "forward",
+            "help",
+            "keymap",
+            "outbox",
+            "preflight",
+            "quit",
+            "restart",
+            "review-inbox",
+            "sync",
+            "vim",
+        ]
+    );
 }
 
 #[test]
@@ -2459,11 +2466,11 @@ fn colon_opens_command_palette() {
 fn palette_tab_completes_top_level_command() {
     let mut state = AppState::new(vec![], test_runtime());
     state.palette.open = true;
-    state.palette.input = "co".to_string();
+    state.palette.input = "com".to_string();
 
     let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-    assert_eq!(state.palette.input, "config ");
+    assert_eq!(state.palette.input, "compose ");
 }
 
 #[test]
@@ -5549,6 +5556,103 @@ fn mail_page_r_opens_reply_panel_from_threads_focus() {
 }
 
 #[test]
+fn compose_shortcut_creates_persisted_independent_draft() {
+    let root = temp_dir("compose-shortcut");
+    let runtime = test_runtime_in(root.clone());
+    fs::create_dir_all(runtime.database_path.parent().expect("compose db parent"))
+        .expect("create compose db parent");
+    db::initialize(&runtime.database_path).expect("initialize compose db");
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    let panel = state
+        .reply_panel
+        .as_ref()
+        .expect("compose panel should open");
+    assert_eq!(panel.from, "CRIEW Test <criew@example.com>");
+    assert!(panel.to.is_empty());
+    assert!(panel.subject.is_empty());
+    assert!(panel.in_reply_to.is_empty());
+    assert!(panel.references.is_empty());
+    assert!(panel.thread_id > 0);
+    assert!(panel.mail_id > 0);
+
+    let drafts =
+        reply_store::list_reply_outbox(&runtime.database_path).expect("list compose outbox");
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].thread_id, panel.thread_id);
+    assert_eq!(drafts[0].mail_id, panel.mail_id);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn forward_shortcut_seeds_forwarded_message_and_persists_draft() {
+    let root = temp_dir("forward-shortcut");
+    let raw = root.join("original.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <original@example.com>\r\nSubject: Original subject\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\n\r\nforwarded body\r\n",
+    )
+    .expect("write forward fixture");
+    let runtime = test_runtime_in(root.clone());
+    seed_mailbox_thread(
+        &runtime.database_path,
+        "inbox",
+        1,
+        "original@example.com",
+        "Original subject",
+    );
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "Original subject",
+            "original@example.com",
+            0,
+            raw.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Threads;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    let panel = state
+        .reply_panel
+        .as_ref()
+        .expect("forward panel should open");
+    assert_eq!(panel.subject, "Fwd: Original subject");
+    assert!(panel.to.is_empty());
+    assert!(panel.in_reply_to.is_empty());
+    assert!(
+        panel
+            .body
+            .iter()
+            .any(|line| line == "From: alice@example.com")
+    );
+    assert!(panel.body.iter().any(|line| line == "forwarded body"));
+    assert_eq!(panel.thread_id, 1);
+    assert_eq!(panel.mail_id, 1);
+
+    let drafts =
+        reply_store::list_reply_outbox(&runtime.database_path).expect("list forward outbox");
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].subject, "Fwd: Original subject");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn reply_panel_restores_persisted_draft_and_outbox_command_lists_it() {
     let root = temp_dir("reply-draft-restore");
     let raw = root.join("patch.eml");
@@ -5609,6 +5713,25 @@ fn reply_panel_restores_persisted_draft_and_outbox_command_lists_it() {
     );
     assert!(!panel.preview_confirmed);
     assert_eq!(panel.draft_status, ReplyDraftStatus::Failed);
+
+    let draft_id = reply_store::list_reply_outbox(&runtime.database_path)
+        .expect("list persisted draft")
+        .first()
+        .expect("persisted draft entry")
+        .id;
+    state.reply_panel = None;
+    state.palette.open = true;
+    state.palette.input = format!("outbox {draft_id}");
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.reply_panel.is_some());
+    assert!(
+        state
+            .status
+            .contains(&format!("reply draft #{draft_id} restored"))
+    );
 
     state.reply_panel = None;
     state.palette.open = true;
