@@ -17,7 +17,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::app::cli::ReviewInboxMode;
 use crate::app::patch as patch_worker;
+use crate::app::review as review_worker;
 use crate::app::sync as sync_worker;
 use crate::domain::subscriptions::{
     DEFAULT_SUBSCRIPTIONS, SubscriptionCategory, category_for_mailbox,
@@ -201,6 +203,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "fetch-thread",
         description: "Fetch the complete thread for a Message-ID",
+    },
+    PaletteCommand {
+        name: "review-inbox",
+        description: "Show patch series that need review or have reviews",
     },
     PaletteCommand {
         name: "config",
@@ -1310,6 +1316,8 @@ struct AppState {
     disabled_qemu_subsystem_expanded: bool,
     threads: Vec<ThreadRow>,
     series_summaries: HashMap<i64, patch_worker::SeriesSummary>,
+    review_summaries: HashMap<i64, review_worker::ReviewInboxEntry>,
+    review_inbox_mode: Option<ReviewInboxMode>,
     filtered_thread_indices: Vec<usize>,
     subscription_index: usize,
     subscription_row_index: usize,
@@ -1434,6 +1442,8 @@ impl AppState {
                 .unwrap_or(true),
             threads,
             series_summaries: HashMap::new(),
+            review_summaries: HashMap::new(),
+            review_inbox_mode: None,
             filtered_thread_indices: Vec::new(),
             subscription_index: 0,
             subscription_row_index: 0,
@@ -1488,6 +1498,7 @@ impl AppState {
             state.subscription_index = index;
         }
         state.refresh_series_summaries();
+        state.refresh_review_summaries();
         state.apply_thread_filter();
         state.sync_subscription_row_to_selected_item();
         state.reconcile_inbox_auto_sync();
@@ -1503,10 +1514,16 @@ impl AppState {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                if query.is_empty()
-                    || row.subject.to_ascii_lowercase().contains(&query)
-                    || row.from_addr.to_ascii_lowercase().contains(&query)
-                    || row.message_id.to_ascii_lowercase().contains(&query)
+                let review_matches = self.review_inbox_mode.is_none_or(|mode| {
+                    self.review_summaries
+                        .get(&row.thread_id)
+                        .is_some_and(|summary| summary.matches_mode(mode))
+                });
+                if review_matches
+                    && (query.is_empty()
+                        || row.subject.to_ascii_lowercase().contains(&query)
+                        || row.from_addr.to_ascii_lowercase().contains(&query)
+                        || row.message_id.to_ascii_lowercase().contains(&query))
                 {
                     Some(index)
                 } else {
@@ -1533,6 +1550,7 @@ impl AppState {
     fn replace_threads(&mut self, threads: Vec<ThreadRow>) {
         self.threads = threads;
         self.refresh_series_summaries();
+        self.refresh_review_summaries();
         self.thread_index = 0;
         self.preview_scroll = 0;
         self.apply_thread_filter();
@@ -1829,6 +1847,24 @@ impl AppState {
         }
     }
 
+    fn refresh_review_summaries(&mut self) {
+        match review_worker::build_review_index(
+            &self.runtime.database_path,
+            &self.active_thread_mailbox,
+            &self.threads,
+        ) {
+            Ok(summaries) => self.review_summaries = summaries,
+            Err(error) => {
+                self.review_summaries.clear();
+                tracing::warn!(
+                    mailbox = %self.active_thread_mailbox,
+                    error = %error,
+                    "failed to hydrate review trailer summaries"
+                );
+            }
+        }
+    }
+
     fn enabled_mailboxes(&self) -> Vec<String> {
         self.subscriptions
             .iter()
@@ -2036,6 +2072,40 @@ impl AppState {
 
     fn queue_palette_sync(&mut self, requested_mailboxes: Vec<String>) {
         let _ = self.start_manual_sync(requested_mailboxes, ManualSyncOrigin::PaletteCommand);
+    }
+
+    fn set_review_inbox_mode(&mut self, mode: Option<ReviewInboxMode>) {
+        self.review_inbox_mode = mode;
+        self.apply_thread_filter();
+        self.status = match mode {
+            Some(mode) => format!(
+                "Review Inbox: {} ({} matching threads)",
+                review_worker::mode_label(mode),
+                self.filtered_thread_indices.len()
+            ),
+            None => "Review Inbox filter cleared".to_string(),
+        };
+    }
+
+    fn queue_palette_review_inbox(&mut self, command: &str) {
+        let command = command.to_ascii_lowercase();
+        let mut parts = command.split_whitespace();
+        let _ = parts.next();
+        let mode = match parts.next().unwrap_or("needs-review") {
+            "needs-review" | "review" => Some(ReviewInboxMode::NeedsReview),
+            "reviewed" | "picked" => Some(ReviewInboxMode::Reviewed),
+            "all" => Some(ReviewInboxMode::All),
+            "off" | "clear" => None,
+            _ => {
+                self.status = "usage: review-inbox [needs-review|reviewed|all|off]".to_string();
+                return;
+            }
+        };
+        if parts.next().is_some() {
+            self.status = "usage: review-inbox [needs-review|reviewed|all|off]".to_string();
+            return;
+        }
+        self.set_review_inbox_mode(mode);
     }
 
     fn start_thread_fetch(&mut self, message_id: String) {

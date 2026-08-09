@@ -15,6 +15,9 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier};
 
+use crate::app::cli::ReviewInboxMode;
+use crate::app::patch::SeriesIntegrity;
+use crate::app::review::ReviewInboxEntry;
 use crate::domain::subscriptions::SubscriptionCategory;
 use crate::infra::bootstrap::BootstrapState;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig, UiKeymap};
@@ -648,8 +651,9 @@ fn empty_query_returns_all_palette_commands() {
     assert_eq!(all[4].name, "keymap");
     assert_eq!(all[5].name, "quit");
     assert_eq!(all[6].name, "restart");
-    assert_eq!(all[7].name, "sync");
-    assert_eq!(all[8].name, "vim");
+    assert_eq!(all[7].name, "review-inbox");
+    assert_eq!(all[8].name, "sync");
+    assert_eq!(all[9].name, "vim");
 }
 
 #[test]
@@ -2480,6 +2484,17 @@ fn palette_tab_completes_sync_mailbox() {
     let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
     assert_eq!(state.palette.input, "sync bpf ");
+}
+
+#[test]
+fn palette_tab_completes_review_inbox_mode() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "review-inbox rev".to_string();
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    assert_eq!(state.palette.input, "review-inbox reviewed ");
 }
 
 #[test]
@@ -4342,6 +4357,58 @@ fn palette_fetch_thread_preserves_message_id_case_and_explicit_mailbox() {
     assert_eq!(fetch.mailbox, "IO-URING");
     assert_eq!(fetch.message_id, "<Patch@EXAMPLE.COM>");
     assert!(!state.palette.open);
+}
+
+#[test]
+fn palette_review_inbox_filters_to_reviewed_patch_series() {
+    let mut state = AppState::new(
+        vec![
+            sample_thread_in_thread(1, 1, "[PATCH 1/1] needs review", "needs@example.com", 0),
+            sample_thread_in_thread(2, 2, "[PATCH 1/1] already reviewed", "done@example.com", 0),
+        ],
+        test_runtime(),
+    );
+    state.review_summaries.insert(
+        1,
+        ReviewInboxEntry {
+            thread_id: 1,
+            subject: "[PATCH 1/1] needs review".to_string(),
+            anchor_message_id: "needs@example.com".to_string(),
+            version: 1,
+            present_count: 1,
+            expected_total: 1,
+            integrity: SeriesIntegrity::Complete,
+            trailers: Vec::new(),
+        },
+    );
+    state.review_summaries.insert(
+        2,
+        ReviewInboxEntry {
+            thread_id: 2,
+            subject: "[PATCH 1/1] already reviewed".to_string(),
+            anchor_message_id: "done@example.com".to_string(),
+            version: 1,
+            present_count: 1,
+            expected_total: 1,
+            integrity: SeriesIntegrity::Complete,
+            trailers: vec![crate::infra::mail_parser::ParsedTrailer {
+                kind: "Reviewed-by".to_string(),
+                value: "Reviewer <reviewer@example.com>".to_string(),
+            }],
+        },
+    );
+    state.palette.open = true;
+    state.palette.input = "review-inbox reviewed".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert_eq!(state.review_inbox_mode, Some(ReviewInboxMode::Reviewed));
+    assert_eq!(state.filtered_thread_indices, vec![1]);
+    assert_eq!(state.status, "Review Inbox: reviewed (1 matching threads)");
 }
 
 #[test]

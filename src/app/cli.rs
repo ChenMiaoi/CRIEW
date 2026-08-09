@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,6 +21,16 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ReviewInboxMode {
+    /// Patch series without a Reviewed-by trailer.
+    NeedsReview,
+    /// Patch series that have received at least one Reviewed-by trailer.
+    Reviewed,
+    /// Show every detected patch series with its review trailers.
+    All,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -52,6 +62,15 @@ pub enum Command {
         #[arg(value_name = "MESSAGE_ID")]
         message_id: String,
     },
+    /// List patch series grouped by review trailer status.
+    ReviewInbox {
+        /// Mailbox or lore list to inspect.
+        #[arg(long)]
+        mailbox: Option<String>,
+        /// Review inbox view (default: needs-review).
+        #[arg(long, value_enum, default_value = "needs-review")]
+        mode: ReviewInboxMode,
+    },
     /// Run environment diagnostics.
     Doctor,
     /// Update CRIEW from crates.io using cargo install.
@@ -62,4 +81,45 @@ pub enum Command {
     },
     /// Print CRIEW version.
     Version,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, ReviewInboxMode};
+    use clap::Parser;
+
+    #[test]
+    fn review_inbox_parses_mode_and_mailbox() {
+        let cli = Cli::try_parse_from([
+            "criew",
+            "review-inbox",
+            "--mailbox",
+            "io-uring",
+            "--mode",
+            "reviewed",
+        ])
+        .expect("parse review inbox command");
+
+        match cli.command {
+            Some(Command::ReviewInbox { mailbox, mode }) => {
+                assert_eq!(mailbox.as_deref(), Some("io-uring"));
+                assert_eq!(mode, ReviewInboxMode::Reviewed);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_inbox_defaults_to_needs_review() {
+        let cli = Cli::try_parse_from(["criew", "review-inbox"])
+            .expect("parse default review inbox command");
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::ReviewInbox {
+                mode: ReviewInboxMode::NeedsReview,
+                ..
+            })
+        ));
+    }
 }

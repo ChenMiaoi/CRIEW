@@ -244,7 +244,16 @@ fn header_context_text(state: &AppState) -> String {
         UiPage::Mail => "Mail",
         UiPage::CodeBrowser => "Code",
     };
-    format!("{page_label} / {}", state.active_thread_mailbox)
+    let context = format!("{page_label} / {}", state.active_thread_mailbox);
+    state
+        .review_inbox_mode
+        .map(|mode| {
+            format!(
+                "{context} / Review Inbox {}",
+                review_worker::mode_label(mode)
+            )
+        })
+        .unwrap_or(context)
 }
 
 fn draw_code_browser_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -447,6 +456,7 @@ fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     row.thread_id,
                     visible_count,
                     state.series_summaries.get(&row.thread_id),
+                    state.review_summaries.get(&row.thread_id),
                 ))
                 .style(
                     Style::default()
@@ -480,6 +490,7 @@ fn thread_group_line(
     thread_id: i64,
     visible_count: usize,
     series: Option<&patch_worker::SeriesSummary>,
+    review: Option<&review_worker::ReviewInboxEntry>,
 ) -> String {
     let noun = if visible_count == 1 { "msg" } else { "msgs" };
     let mut line = format!("Thread {thread_id} ({visible_count} {noun})");
@@ -491,6 +502,13 @@ fn thread_group_line(
             series.expected_total,
             series.integrity.short_label(),
             series.status_label()
+        ));
+    }
+    if let Some(review) = review {
+        line.push_str(&format!(
+            " | review={} ({})",
+            review.status_label(),
+            review.review_count()
         ));
     }
     line
@@ -702,6 +720,17 @@ fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64)
         ),
         format!("Anchor: <{}>", series.anchor_message_id),
     ];
+
+    if let Some(review) = state.review_summaries.get(&thread_id) {
+        lines.push(format!(
+            "Review: {} | trailers={}",
+            review.status_label(),
+            review.review_count()
+        ));
+        for (kind, values) in review.trailer_groups() {
+            lines.push(format!("{kind}: {}", values.join(", ")));
+        }
+    }
 
     if !series.missing_seq.is_empty() {
         lines.push(format!(

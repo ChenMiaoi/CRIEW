@@ -333,7 +333,7 @@ MVP 范围与阶段目标已迁移至独立文档：
 ### 14.1 已决策项
 
 - 工程结构采用四层模块：`app` / `domain` / `infra` / `ui`。
-- CLI 命令固定为：`tui`、`sync`、`fetch-thread`、`doctor`、`version`。
+- CLI 命令固定为：`tui`、`sync`、`fetch-thread`、`review-inbox`、`doctor`、`version`。
 - 配置读取采用 TOML，支持 `--config` 路径覆盖和默认目录策略。
 - 启动阶段统一执行目录引导与 SQLite 初始化迁移，`schema_version` 作为版本入口。
 - b4 检查顺序固定：配置路径 -> `CRIEW_B4_PATH` -> `vendor/b4/b4.sh` -> `PATH` 中 `b4`。
@@ -493,6 +493,26 @@ MVP 范围与阶段目标已迁移至独立文档：
   可增加服务端 capability 探测和受控的全量 header 回退。
 - thread endpoint 与归档服务的 URL 形态仍由外部站点决定，当前通过候选路由、gzip 解码和
   重试复用现有同步错误处理；后续可增加失败缓存和限流。
+
+## 21. M10（已完成）：Review trailer 聚合与 Review Inbox
+
+### 21.1 已决策项
+
+- 同步阶段解析并持久化 `Reviewed-by`、`Acked-by`、`Tested-by` 等 kernel review
+  trailer，按 `mail_id` 保留顺序；邮件重新同步时先替换该邮件的 trailer 集合，避免
+  过期 review 状态残留。
+- `review-inbox` CLI 以 patch series 为单位聚合 trailer，默认列出没有
+  `Reviewed-by` 的 series；`--mode reviewed` 与 `--mode all` 用于查看已收到 review
+  或完整队列。
+- TUI 命令栏提供 `review-inbox [needs-review|reviewed|all|off]`，线程组和预览同时展示
+  review 状态及 reviewer 值，并与现有 subject 搜索组合过滤。
+
+### 21.2 风险与后续动作
+
+- 当前 trailer 解析覆盖常用 kernel review trailer，并忽略引用行；后续可增加更完整的
+  RFC 5322/MIME 签名边界识别，以及 `Link`、`Fixes` 等非 reviewer trailer 的专门视图。
+- Review Inbox 以已同步到本地的 patch series 为范围；后续可接入维护者/路径匹配和
+  `get_maintainer.pl`，自动扩展“应该由谁 review”的候选队列。
 
 ---
 

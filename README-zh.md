@@ -26,6 +26,8 @@ criew doctor
 criew sync --mailbox io-uring
 # 按 Message-ID 补齐完整对话，并重建本地 thread。
 criew fetch-thread --mailbox io-uring '<reply@example.com>'
+# 列出还没有 Reviewed-by trailer 的 patch series。
+criew review-inbox --mailbox io-uring
 criew tui
 ```
 
@@ -33,6 +35,11 @@ criew tui
 `Message-ID` 运行 `fetch-thread`。命令会沿着 `References`/`In-Reply-To`
 查找并幂等写入缺失邮件；TUI 中也可以在线程列表选中邮件后按 `F`，或在
 命令栏输入 `fetch-thread MESSAGE_ID`。
+
+`review-inbox` 会聚合每个 patch thread 中的 `Reviewed-by`、`Acked-by` 和
+`Tested-by` trailer。使用 `--mode reviewed` 查看已经收到 review 的 series，
+使用 `--mode all` 查看全部；TUI 命令栏对应支持
+`review-inbox [needs-review|reviewed|all|off]`。
 
 GitHub Releases 会发布源码包、
 独立二进制文件、

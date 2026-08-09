@@ -630,7 +630,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "restart" => return LoopAction::Restart,
                 "help" => {
                     state.status = format!(
-                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, F fetch thread, u undo apply, e reply/inline edit, r reply, E external vim",
+                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, review-inbox [needs-review|reviewed|all|off], config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, F fetch thread, u undo apply, e reply/inline edit, r reply, E external vim",
                         main_page_focus_shortcuts(&state.main_page_keymap),
                         main_page_move_shortcuts(&state.main_page_keymap)
                     );
@@ -641,6 +641,10 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 }
                 value if value.split_whitespace().next() == Some("fetch-thread") => {
                     state.queue_palette_thread_fetch(&raw_command);
+                    state.dismiss_palette();
+                }
+                value if value.split_whitespace().next() == Some("review-inbox") => {
+                    state.queue_palette_review_inbox(&raw_command);
                     state.dismiss_palette();
                 }
                 value if value.split_whitespace().next() == Some("config") => {

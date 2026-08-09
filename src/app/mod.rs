@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod patch;
+pub mod review;
 pub mod sync;
 pub mod update;
 
@@ -93,6 +94,12 @@ pub fn run() -> Result<()> {
                 },
             )?;
             println!("{}", format_sync_summary(&summary));
+            Ok(())
+        }
+        cli::Command::ReviewInbox { mailbox, mode } => {
+            let mailbox = mailbox.unwrap_or_else(|| runtime.source_mailbox.clone());
+            let entries = review::load_review_inbox(&runtime.database_path, &mailbox, mode)?;
+            println!("{}", review::format_review_inbox(&mailbox, mode, &entries));
             Ok(())
         }
         cli::Command::Doctor => {

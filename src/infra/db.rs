@@ -10,7 +10,7 @@ use rusqlite::{Connection, params};
 
 use crate::infra::error::{CriewError, ErrorCode, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 const CREATE_SCHEMA_VERSION_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -51,6 +51,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         description: "mail query indexes",
         sql: include_str!("../../migrations/0005_mail_query_indexes.sql"),
+    },
+    Migration {
+        version: 6,
+        description: "review trailer storage",
+        sql: include_str!("../../migrations/0006_review_trailers.sql"),
     },
 ];
 

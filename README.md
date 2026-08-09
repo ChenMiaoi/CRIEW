@@ -29,6 +29,8 @@ criew doctor
 criew sync --mailbox io-uring
 # Fetch every message connected to one Message-ID and rebuild the local thread.
 criew fetch-thread --mailbox io-uring '<reply@example.com>'
+# List patch series that still need a Reviewed-by trailer.
+criew review-inbox --mailbox io-uring
 criew tui
 ```
 
@@ -37,6 +39,11 @@ When an incremental sync only captured part of a conversation, run
 `References`/`In-Reply-To`, stores the newly fetched messages idempotently, and
 the TUI exposes the same action as `F` on a selected thread or
 `fetch-thread MESSAGE_ID` in the command palette.
+
+`review-inbox` aggregates `Reviewed-by`, `Acked-by`, and `Tested-by` trailers
+from each patch thread. Use `--mode reviewed` to show picked series or
+`--mode all` to inspect both queues; the TUI offers the same views through
+`review-inbox [needs-review|reviewed|all|off]` in the command palette.
 
 GitHub Releases publish source archives,
 standalone binaries,

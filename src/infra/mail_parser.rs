@@ -15,6 +15,13 @@ pub struct ParsedMailHeaders {
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     pub list_id: Option<String>,
+    pub trailers: Vec<ParsedTrailer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTrailer {
+    pub kind: String,
+    pub value: String,
 }
 
 pub fn parse_headers(raw: &[u8], fallback_message_id: String) -> ParsedMailHeaders {
@@ -51,7 +58,76 @@ pub fn parse_headers(raw: &[u8], fallback_message_id: String) -> ParsedMailHeade
         in_reply_to,
         references,
         list_id: header_value(&headers, "list-id").filter(|value| !value.is_empty()),
+        trailers: parse_review_trailers(raw),
     }
+}
+
+fn parse_review_trailers(raw: &[u8]) -> Vec<ParsedTrailer> {
+    let text = String::from_utf8_lossy(raw);
+    let body = if let Some(separator) = text.find("\r\n\r\n") {
+        &text[separator + 4..]
+    } else if let Some(separator) = text.find("\n\n") {
+        &text[separator + 2..]
+    } else {
+        return Vec::new();
+    };
+
+    let mut trailers: Vec<ParsedTrailer> = Vec::new();
+    let mut current_index: Option<usize> = None;
+    for raw_line in body.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim_start().starts_with('>') {
+            current_index = None;
+            continue;
+        }
+        if let Some(index) = current_index
+            && (line.starts_with(' ') || line.starts_with('\t'))
+            && !line.trim().is_empty()
+        {
+            trailers[index].value.push(' ');
+            trailers[index].value.push_str(line.trim());
+            continue;
+        }
+
+        let Some((kind, value)) = review_trailer_line(line) else {
+            current_index = None;
+            continue;
+        };
+
+        trailers.push(ParsedTrailer { kind, value });
+        current_index = Some(trailers.len() - 1);
+    }
+
+    trailers
+}
+
+fn review_trailer_line(line: &str) -> Option<(String, String)> {
+    if line.trim_start().starts_with('>') {
+        return None;
+    }
+
+    let (kind, value) = line.split_once(':')?;
+    let kind = canonical_review_trailer_kind(kind.trim())?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    Some((kind.to_string(), value.to_string()))
+}
+
+fn canonical_review_trailer_kind(kind: &str) -> Option<&'static str> {
+    [
+        "Reviewed-by",
+        "Acked-by",
+        "Tested-by",
+        "Reported-by",
+        "Suggested-by",
+        "Co-developed-by",
+        "Signed-off-by",
+    ]
+    .into_iter()
+    .find(|candidate| candidate.eq_ignore_ascii_case(kind))
 }
 
 pub fn normalize_subject(subject: &str) -> String {
@@ -224,5 +300,40 @@ mod tests {
     fn normalizes_common_subject_prefixes() {
         assert_eq!(normalize_subject("Re: [PATCH v2 0/3] Demo"), "demo");
         assert_eq!(normalize_subject("fwd:  Re: status"), "status");
+    }
+
+    #[test]
+    fn parses_review_trailers_and_ignores_quoted_values() {
+        let raw = b"Message-ID: <patch@example.com>\nSubject: [PATCH] demo\n\nReviewed-by: Alice Reviewer <alice@example.com>\nAcked-by: Bob <bob@example.com>\n > Reviewed-by: quoted@example.com\nTested-by: Carol <carol@example.com>\n";
+
+        let parsed = parse_headers(raw, "fallback@example.com".to_string());
+
+        assert_eq!(
+            parsed.trailers,
+            vec![
+                super::ParsedTrailer {
+                    kind: "Reviewed-by".to_string(),
+                    value: "Alice Reviewer <alice@example.com>".to_string(),
+                },
+                super::ParsedTrailer {
+                    kind: "Acked-by".to_string(),
+                    value: "Bob <bob@example.com>".to_string(),
+                },
+                super::ParsedTrailer {
+                    kind: "Tested-by".to_string(),
+                    value: "Carol <carol@example.com>".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn folds_review_trailer_continuation_lines() {
+        let raw = b"Message-ID: <patch@example.com>\r\n\r\nReviewed-by: Alice\r\n <alice@example.com>\r\nSigned-off-by: Author <author@example.com>\r\n";
+
+        let parsed = parse_headers(raw, "fallback@example.com".to_string());
+
+        assert_eq!(parsed.trailers[0].value, "Alice <alice@example.com>");
+        assert_eq!(parsed.trailers[1].kind, "Signed-off-by");
     }
 }

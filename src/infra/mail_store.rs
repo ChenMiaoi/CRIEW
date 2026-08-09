@@ -12,7 +12,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::infra::error::{CriewError, ErrorCode, Result};
-use crate::infra::mail_parser::{ParsedMailHeaders, normalize_subject};
+use crate::infra::mail_parser::{ParsedMailHeaders, ParsedTrailer, normalize_subject};
 
 #[derive(Debug, Clone)]
 pub struct MailboxState {
@@ -420,6 +420,66 @@ LIMIT ?2
     collect_thread_rows(rows)
 }
 
+pub fn load_thread_trailers_by_mailbox(
+    path: &Path,
+    mailbox: &str,
+) -> Result<HashMap<i64, Vec<ParsedTrailer>>> {
+    let connection = open_connection(path)?;
+    let mut statement = connection
+        .prepare(
+            "
+SELECT tn.thread_id, mt.kind, mt.value
+FROM thread_node tn
+JOIN mail m ON m.id = tn.mail_id
+JOIN mail_trailer mt ON mt.mail_id = m.id
+WHERE m.imap_mailbox = ?1 AND m.is_expunged = 0
+ORDER BY tn.thread_id ASC, mt.mail_id ASC, mt.ord ASC
+",
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to prepare thread trailer query",
+                error,
+            )
+        })?;
+
+    let rows = statement
+        .query_map(params![mailbox], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                ParsedTrailer {
+                    kind: row.get::<_, String>(1)?,
+                    value: row.get::<_, String>(2)?,
+                },
+            ))
+        })
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to query thread trailers for mailbox '{mailbox}'"),
+                error,
+            )
+        })?;
+
+    let mut trailers_by_thread = HashMap::new();
+    for row in rows {
+        let (thread_id, trailer) = row.map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to decode thread trailer",
+                error,
+            )
+        })?;
+        trailers_by_thread
+            .entry(thread_id)
+            .or_insert_with(Vec::new)
+            .push(trailer);
+    }
+
+    Ok(trailers_by_thread)
+}
+
 fn map_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
     Ok(ThreadRow {
         thread_id: row.get::<_, i64>(0)?,
@@ -679,6 +739,35 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
                 format!(
                     "failed to insert reference '{}' for mail id {}",
                     reference, mail_id
+                ),
+                error,
+            )
+        })?;
+    }
+
+    tx.execute(
+        "DELETE FROM mail_trailer WHERE mail_id = ?1",
+        params![mail_id],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            format!("failed to clear trailers for mail id {mail_id}"),
+            error,
+        )
+    })?;
+
+    for (ord, trailer) in mail.parsed.trailers.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO mail_trailer(mail_id, kind, value, ord) VALUES (?1, ?2, ?3, ?4)",
+            params![mail_id, trailer.kind, trailer.value, ord as i64],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!(
+                    "failed to insert trailer '{}' for mail id {}",
+                    trailer.kind, mail_id
                 ),
                 error,
             )
@@ -1175,7 +1264,8 @@ mod tests {
 
     use super::{
         IncomingMail, SyncBatch, apply_sync_batch, load_mailbox_state, load_thread_rows_by_mailbox,
-        mailbox_message_count, prune_mailbox_subjects, rebuild_all_threads,
+        load_thread_trailers_by_mailbox, mailbox_message_count, prune_mailbox_subjects,
+        rebuild_all_threads,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1300,6 +1390,71 @@ mod tests {
         assert!(!result.mailbox_rebuilt);
         assert_eq!(result.state.last_seen_uid, 5);
         assert_eq!(result.state.highest_modseq, Some(10));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn review_trailers_are_persisted_grouped_by_thread_and_replaced_on_update() {
+        let root = temp_dir("review-trailers");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: 1,
+                highest_uid: 2,
+                highest_modseq: Some(2),
+                mails: vec![
+                    incoming(
+                        "inbox",
+                        1,
+                        "Message-ID: <root@example.com>\nSubject: [PATCH] demo\n\nbody\n",
+                    ),
+                    incoming(
+                        "inbox",
+                        2,
+                        "Message-ID: <review@example.com>\nIn-Reply-To: <root@example.com>\nSubject: Re: [PATCH] demo\n\nReviewed-by: Reviewer <reviewer@example.com>\nAcked-by: Ack <ack@example.com>\n",
+                    ),
+                ],
+            },
+        )
+        .expect("seed review trailers");
+
+        let trailers =
+            load_thread_trailers_by_mailbox(&db_path, "inbox").expect("load review trailers");
+        let values: Vec<String> = trailers
+            .values()
+            .flatten()
+            .map(|trailer| format!("{}={}", trailer.kind, trailer.value))
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().any(|value| value.starts_with("Reviewed-by=")));
+        assert!(values.iter().any(|value| value.starts_with("Acked-by=")));
+
+        apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: 1,
+                highest_uid: 2,
+                highest_modseq: Some(3),
+                mails: vec![incoming(
+                    "inbox",
+                    2,
+                    "Message-ID: <review@example.com>\nIn-Reply-To: <root@example.com>\nSubject: Re: [PATCH] demo\n\nNo trailer now\n",
+                )],
+            },
+        )
+        .expect("update review mail");
+
+        assert!(
+            load_thread_trailers_by_mailbox(&db_path, "inbox")
+                .expect("reload review trailers")
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(root);
     }

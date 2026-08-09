@@ -539,6 +539,7 @@ fn palette_completion_suggestions(
     match command.as_str() {
         "config" => config_completion_suggestions(state, context),
         "sync" => sync_completion_suggestions(state, context),
+        "review-inbox" => review_inbox_completion_suggestions(context),
         _ => Vec::new(),
     }
 }
@@ -608,6 +609,22 @@ fn sync_completion_suggestions(
         .map(|value| PaletteSuggestion {
             value,
             description: Some("Mailbox".to_string()),
+        })
+        .collect()
+}
+
+fn review_inbox_completion_suggestions(
+    context: &PaletteCompletionContext,
+) -> Vec<PaletteSuggestion> {
+    if context.active_index != 1 {
+        return Vec::new();
+    }
+
+    ["needs-review", "reviewed", "all", "off"]
+        .into_iter()
+        .map(|value| PaletteSuggestion {
+            value: value.to_string(),
+            description: Some("Review Inbox view".to_string()),
         })
         .collect()
 }
