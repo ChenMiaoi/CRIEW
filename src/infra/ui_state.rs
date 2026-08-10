@@ -15,6 +15,12 @@ use crate::infra::error::{CriewError, ErrorCode, Result};
 pub const DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH: u16 = 23;
 pub const DEFAULT_MAIL_PREVIEW_WIDTH: u16 = 90;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedView {
+    pub name: String,
+    pub query: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default)]
@@ -39,6 +45,8 @@ pub struct UiState {
     pub mail_subscriptions_width: u16,
     #[serde(default = "default_mail_preview_width")]
     pub mail_preview_width: u16,
+    #[serde(default)]
+    pub saved_views: Vec<SavedView>,
 }
 
 fn default_true() -> bool {
@@ -67,6 +75,7 @@ impl Default for UiState {
             active_mailbox: None,
             mail_subscriptions_width: DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH,
             mail_preview_width: DEFAULT_MAIL_PREVIEW_WIDTH,
+            saved_views: Vec::new(),
         }
     }
 }
@@ -88,6 +97,31 @@ impl UiState {
         }
         mailboxes.sort();
         mailboxes
+    }
+
+    pub fn normalized_saved_views(&self) -> Vec<SavedView> {
+        let mut seen = HashSet::new();
+        let mut views = Vec::new();
+        for view in &self.saved_views {
+            let name = view.name.trim();
+            let query = view.query.trim();
+            if name.is_empty() || query.is_empty() {
+                continue;
+            }
+            let key = name.to_ascii_lowercase();
+            if seen.insert(key) {
+                views.push(SavedView {
+                    name: name.to_string(),
+                    query: query.to_string(),
+                });
+            }
+        }
+        views.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        });
+        views
     }
 }
 
@@ -156,7 +190,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DEFAULT_MAIL_PREVIEW_WIDTH, DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH, UiState, load,
+        DEFAULT_MAIL_PREVIEW_WIDTH, DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH, SavedView, UiState, load,
         path_for_data_dir, save,
     };
 
@@ -186,6 +220,10 @@ mod tests {
             active_mailbox: Some("bpf".to_string()),
             mail_subscriptions_width: 28,
             mail_preview_width: 84,
+            saved_views: vec![SavedView {
+                name: "patches".to_string(),
+                query: "is:patch".to_string(),
+            }],
         };
 
         save(&path, &state).expect("save state");
@@ -205,6 +243,7 @@ mod tests {
         assert_eq!(loaded.active_mailbox.as_deref(), Some("bpf"));
         assert_eq!(loaded.mail_subscriptions_width, 28);
         assert_eq!(loaded.mail_preview_width, 84);
+        assert_eq!(loaded.saved_views, state.saved_views);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -232,6 +271,7 @@ mod tests {
             DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH
         );
         assert_eq!(loaded.mail_preview_width, DEFAULT_MAIL_PREVIEW_WIDTH);
+        assert!(loaded.saved_views.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

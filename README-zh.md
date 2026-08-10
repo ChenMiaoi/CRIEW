@@ -53,6 +53,8 @@ criew tui
 TUI 中按 `/` 可以使用结构化搜索，例如
 `subject:"mm cleanup" from:alice after:2026-01-01 is:patch`；多个条件会同时生效，
 在条件前加 `-` 表示排除，不带字段的词仍按原来的 subject/from/Message-ID 全文匹配。
+可以用命令栏 `view save NAME` 保存当前条件，用 `view use NAME` 重用，或用
+`view list`、`view delete NAME` 管理；Saved View 会写入本地 UI 状态文件，重启 TUI 后仍在。
 
 Reply Panel 打开后会把草稿保存到 SQLite；`git send-email` 失败时会保留可编辑
 草稿、失败原因和 draft 文件。修复凭据或发送链路后，重新打开同一封邮件即可重试；

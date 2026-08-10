@@ -59,6 +59,10 @@ Press `/` in the TUI to search with structured terms such as
 combined, negated with `-`, or left unqualified for the legacy subject/from/
 Message-ID match.
 
+Save a useful filter with `view save NAME`, reuse it with `view use NAME`, and
+manage the persisted list with `view list` or `view delete NAME`. Saved views
+are stored in the local UI state file and survive TUI restarts.
+
 Reply drafts are saved in SQLite while the Reply Panel is open, and a failed
 `git send-email` keeps both the editable draft and failure details. Reopen the
 same mail to retry after fixing credentials or transport; `criew outbox` (or

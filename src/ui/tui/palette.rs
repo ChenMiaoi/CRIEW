@@ -540,6 +540,7 @@ fn palette_completion_suggestions(
         "config" => config_completion_suggestions(state, context),
         "sync" => sync_completion_suggestions(state, context),
         "review-inbox" => review_inbox_completion_suggestions(context),
+        "view" => view_completion_suggestions(state, context),
         _ => Vec::new(),
     }
 }
@@ -627,6 +628,38 @@ fn review_inbox_completion_suggestions(
             description: Some("Review Inbox view".to_string()),
         })
         .collect()
+}
+
+fn view_completion_suggestions(
+    state: &AppState,
+    context: &PaletteCompletionContext,
+) -> Vec<PaletteSuggestion> {
+    if context.active_index == 1 {
+        return ["list", "save", "use", "delete"]
+            .into_iter()
+            .map(|value| PaletteSuggestion {
+                value: value.to_string(),
+                description: Some("Saved view action".to_string()),
+            })
+            .collect();
+    }
+
+    if context.active_index == 2
+        && context.tokens.get(1).is_some_and(|value| {
+            matches!(value.as_str(), "use" | "open" | "delete" | "remove" | "rm")
+        })
+    {
+        return state
+            .saved_views
+            .iter()
+            .map(|view| PaletteSuggestion {
+                value: view.name.clone(),
+                description: Some(view.query.clone()),
+            })
+            .collect();
+    }
+
+    Vec::new()
 }
 
 fn longest_common_prefix(values: &[String]) -> String {

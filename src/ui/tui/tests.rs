@@ -27,7 +27,7 @@ use crate::infra::mail_parser;
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch, ThreadRow};
 use crate::infra::reply_store::{self, ReplyDraftRequest, ReplyDraftStatus, ReplySendStatus};
 use crate::infra::sendmail::{SendOutcome, SendRequest, SendStatus};
-use crate::infra::ui_state::{self, UiState};
+use crate::infra::ui_state::{self, SavedView, UiState};
 
 use super::palette::run_palette_sync;
 use super::preview::preview_warning_message;
@@ -660,6 +660,7 @@ fn empty_query_returns_all_palette_commands() {
             "restart",
             "review-inbox",
             "sync",
+            "view",
             "vim",
         ]
     );
@@ -2471,6 +2472,23 @@ fn palette_tab_completes_top_level_command() {
     let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
     assert_eq!(state.palette.input, "compose ");
+}
+
+#[test]
+fn palette_tab_completes_saved_view_actions_and_names() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.saved_views.push(SavedView {
+        name: "patches".to_string(),
+        query: "is:patch".to_string(),
+    });
+    state.palette.open = true;
+    state.palette.input = "view u".to_string();
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.palette.input, "view use ");
+
+    state.palette.input = "view use p".to_string();
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.palette.input, "view use patches ");
 }
 
 #[test]
@@ -4288,6 +4306,62 @@ fn invalid_structured_search_reports_query_error_without_matches() {
 
     assert!(state.filtered_thread_indices.is_empty());
     assert!(state.status.contains("unknown query field 'label'"));
+}
+
+#[test]
+fn saved_views_persist_apply_and_delete_structured_queries() {
+    let root = temp_dir("saved-views");
+    let runtime = test_runtime_in(root.clone());
+    let mut state = AppState::new(
+        vec![
+            sample_thread("[PATCH] mm cleanup", "mm@example.com", 0),
+            sample_thread("Documentation", "docs@example.com", 0),
+        ],
+        runtime.clone(),
+    );
+    state.search.applied_query = "is:patch".to_string();
+    state.search.input = "is:patch".to_string();
+    state.apply_thread_filter();
+
+    state.palette.open = true;
+    state.palette.input = "view save patches".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(state.saved_views.len(), 1);
+    assert_eq!(state.saved_views[0].query, "is:patch");
+    let persisted = ui_state::load(&ui_state::path_for_data_dir(&runtime.data_dir))
+        .expect("load saved views")
+        .expect("saved view state");
+    assert_eq!(persisted.saved_views[0].name, "patches");
+
+    state.search.applied_query.clear();
+    state.search.input.clear();
+    state.apply_thread_filter();
+    state.palette.open = true;
+    state.palette.input = "view use patches".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(state.search.applied_query, "is:patch");
+    assert_eq!(state.filtered_thread_indices.len(), 1);
+    assert!(state.status.contains("saved view 'patches' applied"));
+
+    state.palette.open = true;
+    state.palette.input = "view delete patches".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.saved_views.is_empty());
+    let persisted = ui_state::load(&ui_state::path_for_data_dir(&runtime.data_dir))
+        .expect("reload saved views")
+        .expect("saved view state");
+    assert!(persisted.saved_views.is_empty());
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

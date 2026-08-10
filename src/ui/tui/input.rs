@@ -645,7 +645,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "restart" => return LoopAction::Restart,
                 "help" => {
                     state.status = format!(
-                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, review-inbox [needs-review|reviewed|all|off], preflight, compose, forward, outbox [DRAFT_ID], config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, P preflight, F fetch thread, C compose, f forward, u undo apply, e reply/inline edit, r reply, E external vim",
+                        "commands: quit, exit, restart, help, sync [mailbox], fetch-thread [--mailbox NAME] MESSAGE_ID, review-inbox [needs-review|reviewed|all|off], preflight, compose, forward, outbox [DRAFT_ID], view [list|save NAME|use NAME|delete NAME], config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, P preflight, F fetch thread, C compose, f forward, u undo apply, e reply/inline edit, r reply, E external vim",
                         main_page_focus_shortcuts(&state.main_page_keymap),
                         main_page_move_shortcuts(&state.main_page_keymap)
                     );
@@ -684,6 +684,10 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 }
                 value if value.split_whitespace().next() == Some("outbox") => {
                     state.handle_palette_outbox(&raw_command);
+                    state.dismiss_palette();
+                }
+                value if value.split_whitespace().next() == Some("view") => {
+                    state.handle_palette_view(&raw_command);
                     state.dismiss_palette();
                 }
                 value if value.split_whitespace().next() == Some("config") => {

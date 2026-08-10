@@ -32,7 +32,7 @@ use crate::infra::reply_store::{
     self, ReplyDraft, ReplyDraftRequest, ReplyDraftStatus, ReplySendRecordRequest, ReplySendStatus,
 };
 use crate::infra::sendmail::{self, SendOutcome, SendRequest, SendStatus};
-use crate::infra::ui_state::{self, UiState};
+use crate::infra::ui_state::{self, SavedView, UiState};
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
@@ -239,6 +239,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "vim",
         description: "Open selected source file in external vim",
+    },
+    PaletteCommand {
+        name: "view",
+        description: "List, save, apply, or delete saved thread views",
     },
 ];
 
@@ -1432,6 +1436,7 @@ struct AppState {
     last_apply_snapshot: Option<LastApplySnapshot>,
     palette: CommandPaletteState,
     search: SearchState,
+    saved_views: Vec<SavedView>,
     config_editor: ConfigEditorState,
     keymap_editor: KeymapEditorState,
     external_editor_runner: ExternalEditorRunner,
@@ -1470,6 +1475,10 @@ impl AppState {
         let enabled_mailboxes = persisted
             .as_ref()
             .map(UiState::normalized_enabled_mailboxes)
+            .unwrap_or_default();
+        let saved_views = persisted
+            .as_ref()
+            .map(UiState::normalized_saved_views)
             .unwrap_or_default();
         let enabled_mailboxes: HashSet<String> = enabled_mailboxes.into_iter().collect();
         let active_thread_mailbox = persisted
@@ -1558,6 +1567,7 @@ impl AppState {
             last_apply_snapshot: None,
             palette: CommandPaletteState::default(),
             search: SearchState::default(),
+            saved_views,
             config_editor: ConfigEditorState::default(),
             keymap_editor: KeymapEditorState::default(),
             external_editor_runner: run_external_editor_session,
@@ -3140,6 +3150,7 @@ impl AppState {
             active_mailbox: Some(self.active_thread_mailbox.clone()),
             mail_subscriptions_width: self.mail_pane_layout.subscriptions_width,
             mail_preview_width: self.mail_pane_layout.preview_width,
+            saved_views: self.saved_views.clone(),
         }
     }
 
@@ -4722,6 +4733,154 @@ impl AppState {
         self.search.applied_query = self.search.input.trim().to_string();
         self.thread_index = 0;
         self.apply_thread_filter();
+    }
+
+    fn list_saved_views(&mut self) {
+        if self.saved_views.is_empty() {
+            self.status = "saved views: <none>".to_string();
+            return;
+        }
+        let entries = self
+            .saved_views
+            .iter()
+            .map(|view| format!("{}={}", view.name, view.query))
+            .collect::<Vec<String>>();
+        self.status = format!("saved views: {}", entries.join("; "));
+    }
+
+    fn save_current_view(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty()
+            || !name.chars().all(|character| {
+                character.is_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+        {
+            self.status =
+                "usage: view save NAME (NAME may contain letters, digits, -, _, or .)".to_string();
+            return;
+        }
+        let query = self.search.applied_query.trim();
+        if query.is_empty() {
+            self.status = "cannot save an empty search; apply a query first".to_string();
+            return;
+        }
+        if let Err(error) = parse_query(query) {
+            self.status = format!("cannot save invalid search: {error}");
+            return;
+        }
+
+        if let Some(view) = self
+            .saved_views
+            .iter_mut()
+            .find(|view| view.name.eq_ignore_ascii_case(name))
+        {
+            view.name = name.to_string();
+            view.query = query.to_string();
+        } else {
+            self.saved_views.push(SavedView {
+                name: name.to_string(),
+                query: query.to_string(),
+            });
+        }
+        self.saved_views.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        });
+        self.persist_ui_state();
+        self.status = format!("saved view '{name}' = {query}");
+    }
+
+    fn use_saved_view(&mut self, name: &str) {
+        let Some(view) = self
+            .saved_views
+            .iter()
+            .find(|view| view.name.eq_ignore_ascii_case(name))
+            .cloned()
+        else {
+            self.status = format!("saved view '{name}' was not found");
+            return;
+        };
+        if let Err(error) = parse_query(&view.query) {
+            self.status = format!("saved view '{}' is invalid: {error}", view.name);
+            return;
+        }
+        self.search.active = false;
+        self.search.input = view.query.clone();
+        self.search.applied_query = view.query.clone();
+        self.thread_index = 0;
+        self.apply_thread_filter();
+        self.status = format!(
+            "saved view '{}' applied: {} matches",
+            view.name,
+            self.filtered_thread_indices.len()
+        );
+    }
+
+    fn delete_saved_view(&mut self, name: &str) {
+        let before = self.saved_views.len();
+        self.saved_views
+            .retain(|view| !view.name.eq_ignore_ascii_case(name));
+        if self.saved_views.len() == before {
+            self.status = format!("saved view '{name}' was not found");
+            return;
+        }
+        self.persist_ui_state();
+        self.status = format!("saved view '{name}' deleted");
+    }
+
+    fn handle_palette_view(&mut self, command: &str) {
+        let mut parts = command.split_whitespace();
+        let _ = parts.next();
+        let Some(action) = parts.next() else {
+            self.list_saved_views();
+            return;
+        };
+        match action.to_ascii_lowercase().as_str() {
+            "list" => {
+                if parts.next().is_some() {
+                    self.status = "usage: view list".to_string();
+                } else {
+                    self.list_saved_views();
+                }
+            }
+            "save" => {
+                let Some(name) = parts.next() else {
+                    self.status = "usage: view save NAME".to_string();
+                    return;
+                };
+                if parts.next().is_some() {
+                    self.status = "usage: view save NAME".to_string();
+                } else {
+                    self.save_current_view(name);
+                }
+            }
+            "use" | "open" => {
+                let Some(name) = parts.next() else {
+                    self.status = "usage: view use NAME".to_string();
+                    return;
+                };
+                if parts.next().is_some() {
+                    self.status = "usage: view use NAME".to_string();
+                } else {
+                    self.use_saved_view(name);
+                }
+            }
+            "delete" | "remove" | "rm" => {
+                let Some(name) = parts.next() else {
+                    self.status = "usage: view delete NAME".to_string();
+                    return;
+                };
+                if parts.next().is_some() {
+                    self.status = "usage: view delete NAME".to_string();
+                } else {
+                    self.delete_saved_view(name);
+                }
+            }
+            _ => {
+                self.status = "usage: view [list|save NAME|use NAME|delete NAME]".to_string();
+            }
+        }
     }
 
     fn toggle_palette(&mut self) {
