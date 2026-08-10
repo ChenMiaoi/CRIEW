@@ -56,6 +56,11 @@ TUI 中按 `/` 可以使用结构化搜索，例如
 可以用命令栏 `view save NAME` 保存当前条件，用 `view use NAME` 重用，或用
 `view list`、`view delete NAME` 管理；Saved View 会写入本地 UI 状态文件，重启 TUI 后仍在。
 
+邮件 `Preview` 面板仍然保持正文的纯文本语义，但会用终端颜色帮助快速定位审阅重点：
+头部使用青色，diff 文件标记使用洋红色，hunk 标记使用蓝色，新增行使用绿色，删除行使用红色，
+引用上下文使用灰色，代码围栏使用青色，解析警告使用黄色。普通叙述保持终端默认样式，颜色不会
+改变邮件文本或滚动行为。
+
 Reply Panel 打开后会把草稿保存到 SQLite；`git send-email` 失败时会保留可编辑
 草稿、失败原因和 draft 文件。修复凭据或发送链路后，重新打开同一封邮件即可重试；
 `criew outbox` 或 TUI 命令栏的 `outbox` 会列出待处理草稿和失败回信。TUI 中按

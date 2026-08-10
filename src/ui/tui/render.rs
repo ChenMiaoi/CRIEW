@@ -642,11 +642,97 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         state.preview_scroll,
         VerticalScrollWrapMode::Enabled,
     );
-    let paragraph = Paragraph::new(preview.as_ref())
+    let preview_text = colorize_mail_preview(preview.as_ref());
+    let paragraph = Paragraph::new(preview_text)
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, content_area);
+}
+
+#[derive(Debug, Default)]
+struct PreviewColorContext {
+    in_patch: bool,
+    in_code_fence: bool,
+    pending_old_file: bool,
+}
+
+fn colorize_mail_preview(content: &str) -> Text<'static> {
+    let mut context = PreviewColorContext::default();
+    let lines = content
+        .split('\n')
+        .map(|line| {
+            let style = preview_line_style(line, &mut context);
+            Line::from(Span::styled(line.to_string(), style))
+        })
+        .collect::<Vec<Line<'static>>>();
+    Text::from(lines)
+}
+
+fn preview_line_style(line: &str, context: &mut PreviewColorContext) -> Style {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+        context.in_code_fence = !context.in_code_fence;
+        return Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD);
+    }
+
+    if line.starts_with("diff --git ") {
+        context.in_patch = true;
+        context.pending_old_file = false;
+        return Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+    }
+    if line.starts_with("@@") {
+        context.in_patch = true;
+        context.pending_old_file = false;
+        return Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD);
+    }
+    if context.in_patch && line.starts_with("--- ") {
+        context.pending_old_file = true;
+        return Style::default().fg(Color::LightRed);
+    }
+    if context.pending_old_file && line.starts_with("+++ ") {
+        context.pending_old_file = false;
+        context.in_patch = true;
+        return Style::default().fg(Color::LightGreen);
+    }
+    if context.in_patch && line.starts_with('-') {
+        return Style::default().fg(Color::LightRed);
+    }
+    if context.in_patch && line.starts_with('+') {
+        return Style::default().fg(Color::LightGreen);
+    }
+    if context.in_patch && line.starts_with("\\ No newline") {
+        return Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+    }
+    if context.in_code_fence {
+        return Style::default().fg(Color::LightCyan);
+    }
+    if line.starts_with("[!]") {
+        return Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+    }
+    if matches!(
+        line.split_once(':').map(|(name, _)| name),
+        Some("From" | "Sent" | "To" | "Cc" | "Subject")
+    ) {
+        return Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD);
+    }
+    if trimmed.starts_with('>') {
+        return Style::default().fg(Color::DarkGray);
+    }
+
+    Style::default()
 }
 
 fn clamp_vertical_scroll(
@@ -1642,12 +1728,40 @@ pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
 
 #[cfg(test)]
 mod tests {
-    use super::format_uptime_label;
+    use ratatui::style::Color;
+
+    use super::{colorize_mail_preview, format_uptime_label};
 
     #[test]
     fn uptime_label_uses_the_largest_needed_unit() {
         assert_eq!(format_uptime_label(59), "59s");
         assert_eq!(format_uptime_label(61), "01m:01s");
         assert_eq!(format_uptime_label(3_661), "01h:01m:01s");
+    }
+
+    #[test]
+    fn mail_preview_colorizes_headers_and_patch_hunks() {
+        let text = colorize_mail_preview(
+            "From: Alice <alice@example.com>\n\ndiff --git a/a.c b/a.c\n@@ -1 +1 @@\n-old line\n+new line\n> quoted context",
+        );
+
+        assert_eq!(text.lines[0].spans[0].style.fg, Some(Color::LightCyan));
+        assert_eq!(text.lines[2].spans[0].style.fg, Some(Color::Magenta));
+        assert_eq!(text.lines[3].spans[0].style.fg, Some(Color::LightBlue));
+        assert_eq!(text.lines[4].spans[0].style.fg, Some(Color::LightRed));
+        assert_eq!(text.lines[5].spans[0].style.fg, Some(Color::LightGreen));
+        assert_eq!(text.lines[6].spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn mail_preview_keeps_regular_prose_unstyled_and_marks_warnings() {
+        let text =
+            colorize_mail_preview("plain prose\n[!] NON-PLAIN-TEXT MAIL\n```\nlet value = 1;\n```");
+
+        assert_eq!(text.lines[0].spans[0].style.fg, None);
+        assert_eq!(text.lines[1].spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(text.lines[2].spans[0].style.fg, Some(Color::LightCyan));
+        assert_eq!(text.lines[3].spans[0].style.fg, Some(Color::LightCyan));
+        assert_eq!(text.lines[4].spans[0].style.fg, Some(Color::LightCyan));
     }
 }

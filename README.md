@@ -63,6 +63,13 @@ Save a useful filter with `view save NAME`, reuse it with `view use NAME`, and
 manage the persisted list with `view list` or `view delete NAME`. Saved views
 are stored in the local UI state file and survive TUI restarts.
 
+The mail `Preview` pane keeps the message body as plain text while adding
+semantic terminal colors for review: headers are cyan, diff file markers are
+magenta, hunk headers are blue, added lines are green, removed lines are red,
+quoted context is gray, fenced code is cyan, and parser warnings are yellow.
+Regular prose keeps the default terminal style, so colors help locate patch
+content without changing the underlying mail text or scroll behavior.
+
 Reply drafts are saved in SQLite while the Reply Panel is open, and a failed
 `git send-email` keeps both the editable draft and failure details. Reopen the
 same mail to retry after fixing credentials or transport; `criew outbox` (or
