@@ -50,6 +50,10 @@ criew tui
 运行历史。TUI 在线程列表选中 patch series 后按 `P`，或在命令栏输入
 `preflight`，可以执行同一项检查。
 
+TUI 中按 `/` 可以使用结构化搜索，例如
+`subject:"mm cleanup" from:alice after:2026-01-01 is:patch`；多个条件会同时生效，
+在条件前加 `-` 表示排除，不带字段的词仍按原来的 subject/from/Message-ID 全文匹配。
+
 Reply Panel 打开后会把草稿保存到 SQLite；`git send-email` 失败时会保留可编辑
 草稿、失败原因和 draft 文件。修复凭据或发送链路后，重新打开同一封邮件即可重试；
 `criew outbox` 或 TUI 命令栏的 `outbox` 会列出待处理草稿和失败回信。TUI 中按

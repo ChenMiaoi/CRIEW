@@ -49,6 +49,7 @@ mod input;
 mod keymap;
 mod palette;
 mod preview;
+mod query;
 mod render;
 mod reply;
 #[cfg(test)]
@@ -73,6 +74,7 @@ use render::{draw, subscription_line};
 use preview::{MailPreview, extract_mail_body_text, load_mail_preview};
 #[cfg(test)]
 use preview::{extract_mail_body_preview, extract_mail_preview};
+use query::parse_query;
 use reply::{
     PreparedReplyMessage, ReplyIdentity, ReplyPreview, ReplyPreviewLine, ReplyPreviewRequest,
     ReplySeed, build_reply_seed, prepare_reply_message, render_reply_preview,
@@ -1594,7 +1596,16 @@ impl AppState {
     }
 
     fn apply_thread_filter(&mut self) {
-        let query = self.search.applied_query.trim().to_ascii_lowercase();
+        let query = match parse_query(&self.search.applied_query) {
+            Ok(query) => query,
+            Err(error) => {
+                self.filtered_thread_indices.clear();
+                self.thread_index = 0;
+                self.refresh_selected_mail_preview();
+                self.status = format!("search error: {error}");
+                return;
+            }
+        };
 
         self.filtered_thread_indices = self
             .threads
@@ -1606,12 +1617,11 @@ impl AppState {
                         .get(&row.thread_id)
                         .is_some_and(|summary| summary.matches_mode(mode))
                 });
-                if review_matches
-                    && (query.is_empty()
-                        || row.subject.to_ascii_lowercase().contains(&query)
-                        || row.from_addr.to_ascii_lowercase().contains(&query)
-                        || row.message_id.to_ascii_lowercase().contains(&query))
-                {
+                let review_status = self
+                    .review_summaries
+                    .get(&row.thread_id)
+                    .map(|summary| summary.status_label());
+                if review_matches && query.matches(row, review_status) {
                     Some(index)
                 } else {
                     None

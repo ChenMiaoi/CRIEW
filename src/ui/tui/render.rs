@@ -1521,7 +1521,9 @@ fn draw_search_overlay(frame: &mut Frame<'_>, state: &AppState) {
     let input = Paragraph::new(format!("> {}", state.search.input));
     frame.render_widget(input, sections[0]);
 
-    let hint = Paragraph::new("Enter: apply and locate first match  Esc: cancel");
+    let hint = Paragraph::new(
+        "Enter: apply  Esc: cancel  syntax: subject:, from:, id:, after:, before:, review:, is:patch, -term",
+    );
     frame.render_widget(hint, sections[1]);
 
     let current = if state.search.applied_query.is_empty() {

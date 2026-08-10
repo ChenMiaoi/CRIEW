@@ -54,6 +54,11 @@ from each patch thread. Use `--mode reviewed` to show picked series or
 persists the result in the patch run history. The TUI exposes the same check
 as `P` on a selected patch series or `preflight` in the command palette.
 
+Press `/` in the TUI to search with structured terms such as
+`subject:"mm cleanup" from:alice after:2026-01-01 is:patch`; terms can be
+combined, negated with `-`, or left unqualified for the legacy subject/from/
+Message-ID match.
+
 Reply drafts are saved in SQLite while the Reply Panel is open, and a failed
 `git send-email` keeps both the editable draft and failure details. Reopen the
 same mail to retry after fixing credentials or transport; `criew outbox` (or

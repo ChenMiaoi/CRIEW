@@ -4233,6 +4233,64 @@ fn slash_opens_search_and_filters_threads() {
 }
 
 #[test]
+fn structured_search_filters_subject_sender_id_and_negation() {
+    let mut second = sample_thread("[PATCH] net fix", "net@example.com", 0);
+    second.from_addr = "Bob <bob@example.com>".to_string();
+    let mut state = AppState::new(
+        vec![
+            sample_thread("[PATCH] mm cleanup", "mm@example.com", 0),
+            second,
+            sample_thread("[PATCH] docs update", "docs@example.com", 0),
+        ],
+        test_runtime(),
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    );
+    type_text(
+        &mut state,
+        "subject:\"net fix\" from:bob id:net -subject:docs",
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert_eq!(state.filtered_thread_indices.len(), 1);
+    assert_eq!(
+        state
+            .selected_thread()
+            .expect("selected structured result")
+            .message_id,
+        "net@example.com"
+    );
+    assert!(state.status.contains("1 matches"));
+}
+
+#[test]
+fn invalid_structured_search_reports_query_error_without_matches() {
+    let mut state = AppState::new(
+        vec![sample_thread("[PATCH] demo", "demo@example.com", 0)],
+        test_runtime(),
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    );
+    type_text(&mut state, "label:demo");
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(state.filtered_thread_indices.is_empty());
+    assert!(state.status.contains("unknown query field 'label'"));
+}
+
+#[test]
 fn search_on_code_browser_reports_mail_only_scope() {
     let mut state = AppState::new(vec![], test_runtime());
     state.ui_page = UiPage::CodeBrowser;
