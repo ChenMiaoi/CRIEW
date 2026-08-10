@@ -729,7 +729,8 @@ fn preview_line_style(line: &str, context: &mut PreviewColorContext) -> Style {
             .add_modifier(Modifier::BOLD);
     }
     if trimmed.starts_with('>') {
-        return Style::default().fg(Color::DarkGray);
+        // Keep quoted context legible across dark and light terminal themes.
+        return Style::default().fg(Color::Gray);
     }
 
     Style::default()
@@ -1750,7 +1751,7 @@ mod tests {
         assert_eq!(text.lines[3].spans[0].style.fg, Some(Color::LightBlue));
         assert_eq!(text.lines[4].spans[0].style.fg, Some(Color::LightRed));
         assert_eq!(text.lines[5].spans[0].style.fg, Some(Color::LightGreen));
-        assert_eq!(text.lines[6].spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(text.lines[6].spans[0].style.fg, Some(Color::Gray));
     }
 
     #[test]
