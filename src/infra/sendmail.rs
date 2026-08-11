@@ -246,13 +246,11 @@ fn send_with_options(
     }
 
     let draft_path = stabilize_child_path(&draft_path);
-    let command_line = render_command_line(
-        &resolved.display_name,
-        &build_send_email_args(request, &draft_path),
-    );
+    let args = build_send_email_args(request, &draft_path);
+    let command_line = render_command_line(&resolved.display_name, &args);
 
     let mut command = Command::new(&resolved.command);
-    command.args(build_send_email_args(request, &draft_path));
+    command.args(&args);
     command
         .current_dir(resolve_working_dir(runtime))
         .stdin(Stdio::null())
@@ -262,7 +260,7 @@ fn send_with_options(
         // surface as structured outcomes the UI can record and display.
         .env("GIT_TERMINAL_PROMPT", "0");
 
-    let mut child = match spawn_command_with_retry(&mut command) {
+    let child = match spawn_command_with_retry(&mut command) {
         Ok(child) => child,
         Err(error) => {
             return failed_outcome(
@@ -275,6 +273,49 @@ fn send_with_options(
         }
     };
 
+    let (output, timed_out) = match wait_for_command(child, timeout) {
+        Ok(result) => result,
+        Err(WaitError::Polling(error)) => {
+            return failed_outcome(
+                message_id,
+                started_at,
+                Some(command_line),
+                Some(draft_path),
+                format!("failed while waiting for git send-email: {error}"),
+            );
+        }
+        Err(WaitError::Collecting(error)) => {
+            return failed_outcome(
+                message_id,
+                started_at,
+                Some(command_line),
+                Some(draft_path),
+                format!("failed to collect git send-email output: {error}"),
+            );
+        }
+    };
+
+    build_process_outcome(
+        message_id,
+        started_at,
+        command_line,
+        draft_path,
+        output,
+        timed_out,
+        timeout,
+    )
+}
+
+#[derive(Debug)]
+enum WaitError {
+    Polling(std::io::Error),
+    Collecting(std::io::Error),
+}
+
+fn wait_for_command(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> std::result::Result<(std::process::Output, bool), WaitError> {
     let start = Instant::now();
     let mut timed_out = false;
     loop {
@@ -288,42 +329,38 @@ fn send_with_options(
                 }
                 thread::sleep(Duration::from_millis(30));
             }
-            Err(error) => {
-                return failed_outcome(
-                    message_id,
-                    started_at,
-                    Some(command_line),
-                    Some(draft_path),
-                    format!("failed while waiting for git send-email: {error}"),
-                );
-            }
+            Err(error) => return Err(WaitError::Polling(error)),
         }
     }
 
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(error) => {
-            return failed_outcome(
-                message_id,
-                started_at,
-                Some(command_line),
-                Some(draft_path),
-                format!("failed to collect git send-email output: {error}"),
-            );
-        }
-    };
+    child
+        .wait_with_output()
+        .map(|output| (output, timed_out))
+        .map_err(WaitError::Collecting)
+}
 
+fn build_process_outcome(
+    message_id: String,
+    started_at: String,
+    command_line: String,
+    draft_path: PathBuf,
+    output: std::process::Output,
+    timed_out: bool,
+    timeout: Duration,
+) -> SendOutcome {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let finished_at = now_timestamp();
+    let exit_code = output.status.code();
+    let command_line = Some(command_line);
 
     if timed_out {
         return SendOutcome {
             transport: "git-send-email".to_string(),
             message_id,
-            command_line: Some(command_line),
+            command_line,
             draft_path: Some(draft_path),
-            exit_code: output.status.code(),
+            exit_code,
             timed_out: true,
             stdout,
             stderr,
@@ -344,9 +381,9 @@ fn send_with_options(
         return SendOutcome {
             transport: "git-send-email".to_string(),
             message_id,
-            command_line: Some(command_line),
+            command_line,
             draft_path: None,
-            exit_code: output.status.code(),
+            exit_code,
             timed_out: false,
             stdout,
             stderr,
@@ -360,13 +397,13 @@ fn send_with_options(
     SendOutcome {
         transport: "git-send-email".to_string(),
         message_id,
-        command_line: Some(command_line),
+        command_line,
         draft_path: Some(draft_path),
-        exit_code: output.status.code(),
+        exit_code,
         timed_out: false,
-        stdout: stdout.clone(),
-        stderr: stderr.clone(),
-        error_summary: summarize_failure(output.status.code(), &stdout, &stderr),
+        error_summary: summarize_failure(exit_code, &stdout, &stderr),
+        stdout,
+        stderr,
         started_at,
         finished_at,
         status: SendStatus::Failed,

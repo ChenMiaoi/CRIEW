@@ -91,39 +91,70 @@ impl SyncSource {
             Self::Lore { base_url } => base_url.clone(),
         }
     }
+
+    fn is_fixture(&self) -> bool {
+        matches!(self, Self::Fixture { .. })
+    }
+
+    fn is_following(&self) -> bool {
+        matches!(self, Self::Following { .. })
+    }
+
+    fn storage_mailbox<'a>(&self, mailbox: &'a str) -> &'a str {
+        if self.is_following() {
+            IMAP_INBOX_MAILBOX
+        } else {
+            mailbox
+        }
+    }
+
+    fn client(&self, config: &RuntimeConfig) -> Result<Box<dyn ImapClient>> {
+        match self {
+            Self::Fixture {
+                fixture_dir,
+                uidvalidity_hint,
+            } => Ok(Box::new(FixtureImapClient::new(
+                fixture_dir.clone(),
+                *uidvalidity_hint,
+            ))),
+            Self::Following { .. } => Ok(Box::new(RemoteImapClient::new(config.imap.clone())?)),
+            Self::GnuArchive => Ok(Box::new(GnuArchiveClient::new(None)?)),
+            Self::Lore { base_url } => Ok(Box::new(LoreImapClient::new(Some(base_url))?)),
+        }
+    }
+
+    fn select_thread_snapshot(
+        &self,
+        client: &mut dyn ImapClient,
+        mailbox: &str,
+        checkpoint: Option<&mail_store::MailboxState>,
+        checkpoint_last_seen_uid: u32,
+    ) -> Result<MailboxSnapshot> {
+        match self {
+            Self::Lore { .. } => {
+                // A native public-inbox thread endpoint is independent of the
+                // mailbox's recent Atom feed. Reuse the persisted checkpoint so
+                // an old thread can still be recovered after it leaves the feed.
+                Ok(MailboxSnapshot {
+                    uidvalidity: checkpoint.map(|state| state.uidvalidity).unwrap_or(1),
+                    highest_uid: checkpoint_last_seen_uid,
+                    highest_modseq: checkpoint.and_then(|state| state.highest_modseq),
+                })
+            }
+            _ => client.select_mailbox(mailbox),
+        }
+    }
 }
 
 pub fn run(config: &RuntimeConfig, request: SyncRequest) -> Result<SyncSummary> {
     let source = resolve_sync_source(config, &request)?;
-    let attempts = request.reconnect_attempts.max(1);
-    let mut last_error: Option<CriewError> = None;
-
-    for attempt in 1..=attempts {
-        match run_once(config, &request.mailbox, &source) {
-            Ok(summary) => return Ok(summary),
-            Err(error) => {
-                tracing::warn!(
-                    attempt,
-                    attempts,
-                    mailbox = %request.mailbox,
-                    source = %source.label(),
-                    error = %error,
-                    "sync attempt failed"
-                );
-                last_error = Some(error);
-                if attempt < attempts {
-                    thread::sleep(Duration::from_millis(200));
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        CriewError::new(
-            ErrorCode::Imap,
-            format!("sync failed after {} attempts", attempts),
-        )
-    }))
+    retry_sync(
+        request.reconnect_attempts,
+        &request.mailbox,
+        &source,
+        None,
+        || run_once(config, &request.mailbox, &source),
+    )
 }
 
 pub fn fetch_thread(config: &RuntimeConfig, request: ThreadFetchRequest) -> Result<SyncSummary> {
@@ -136,22 +167,52 @@ pub fn fetch_thread(config: &RuntimeConfig, request: ThreadFetchRequest) -> Resu
             reconnect_attempts: request.reconnect_attempts,
         },
     )?;
-    let attempts = request.reconnect_attempts.max(1);
-    let mut last_error: Option<CriewError> = None;
+    retry_sync(
+        request.reconnect_attempts,
+        &request.mailbox,
+        &source,
+        Some(&request.message_id),
+        || fetch_thread_once(config, &request.mailbox, &request.message_id, &source),
+    )
+}
+
+fn retry_sync<T, F>(
+    requested_attempts: u8,
+    mailbox: &str,
+    source: &SyncSource,
+    message_id: Option<&str>,
+    mut operation: F,
+) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    let attempts = requested_attempts.max(1);
+    let mut last_error = None;
 
     for attempt in 1..=attempts {
-        match fetch_thread_once(config, &request.mailbox, &request.message_id, &source) {
-            Ok(summary) => return Ok(summary),
+        match operation() {
+            Ok(value) => return Ok(value),
             Err(error) => {
-                tracing::warn!(
-                    attempt,
-                    attempts,
-                    mailbox = %request.mailbox,
-                    message_id = %request.message_id,
-                    source = %source.label(),
-                    error = %error,
-                    "thread fetch attempt failed"
-                );
+                if let Some(message_id) = message_id {
+                    tracing::warn!(
+                        attempt,
+                        attempts,
+                        mailbox,
+                        message_id,
+                        source = %source.label(),
+                        error = %error,
+                        "thread fetch attempt failed"
+                    );
+                } else {
+                    tracing::warn!(
+                        attempt,
+                        attempts,
+                        mailbox,
+                        source = %source.label(),
+                        error = %error,
+                        "sync attempt failed"
+                    );
+                }
                 last_error = Some(error);
                 if attempt < attempts {
                     thread::sleep(Duration::from_millis(200));
@@ -161,9 +222,14 @@ pub fn fetch_thread(config: &RuntimeConfig, request: ThreadFetchRequest) -> Resu
     }
 
     Err(last_error.unwrap_or_else(|| {
+        let operation_name = if message_id.is_some() {
+            "thread fetch"
+        } else {
+            "sync"
+        };
         CriewError::new(
             ErrorCode::Imap,
-            format!("thread fetch failed after {} attempts", attempts),
+            format!("{operation_name} failed after {attempts} attempts"),
         )
     }))
 }
@@ -212,55 +278,23 @@ fn resolve_sync_source(config: &RuntimeConfig, request: &SyncRequest) -> Result<
     })
 }
 
-fn storage_mailbox<'a>(mailbox: &'a str, source: &SyncSource) -> &'a str {
-    match source {
-        SyncSource::Following { .. } => IMAP_INBOX_MAILBOX,
-        _ => mailbox,
-    }
-}
-
 fn fetch_thread_once(
     config: &RuntimeConfig,
     mailbox: &str,
     message_id: &str,
     source: &SyncSource,
 ) -> Result<SyncSummary> {
-    let storage_mailbox = storage_mailbox(mailbox, source);
-    let checkpoint = mail_store::load_mailbox_state(&config.database_path, storage_mailbox)?;
-    let checkpoint_last_seen_uid = checkpoint
-        .as_ref()
-        .map(|state| state.last_seen_uid)
-        .unwrap_or(0);
-    let mut client: Box<dyn ImapClient> = match source {
-        SyncSource::Fixture {
-            fixture_dir,
-            uidvalidity_hint,
-        } => Box::new(FixtureImapClient::new(
-            fixture_dir.to_path_buf(),
-            *uidvalidity_hint,
-        )),
-        SyncSource::Following { .. } => Box::new(RemoteImapClient::new(config.imap.clone())?),
-        SyncSource::GnuArchive => Box::new(GnuArchiveClient::new(None)?),
-        SyncSource::Lore { base_url } => Box::new(LoreImapClient::new(Some(base_url))?),
-    };
+    let storage_mailbox = source.storage_mailbox(mailbox);
+    let (checkpoint, checkpoint_last_seen_uid) = load_checkpoint(config, storage_mailbox)?;
+    let mut client = source.client(config)?;
 
     client.connect()?;
-    let snapshot = match source {
-        SyncSource::Lore { .. } => {
-            // A native public-inbox thread endpoint is independent of the
-            // mailbox's recent Atom feed. Reuse the persisted checkpoint so
-            // an old thread can still be recovered after it leaves the feed.
-            MailboxSnapshot {
-                uidvalidity: checkpoint
-                    .as_ref()
-                    .map(|state| state.uidvalidity)
-                    .unwrap_or(1),
-                highest_uid: checkpoint_last_seen_uid,
-                highest_modseq: checkpoint.as_ref().and_then(|state| state.highest_modseq),
-            }
-        }
-        _ => client.select_mailbox(storage_mailbox)?,
-    };
+    let snapshot = source.select_thread_snapshot(
+        client.as_mut(),
+        storage_mailbox,
+        checkpoint.as_ref(),
+        checkpoint_last_seen_uid,
+    )?;
     let remote_messages = client.fetch_thread(storage_mailbox, message_id)?;
     let envelopes = parse_remote_messages(storage_mailbox, remote_messages);
     let requested_message_id = normalize_requested_message_id(message_id);
@@ -275,74 +309,21 @@ fn fetch_thread_once(
     }
 
     let fetched = envelopes.len();
-    let mut incoming = Vec::with_capacity(fetched);
-    let mut synthetic_uid = checkpoint_last_seen_uid;
-    for envelope in envelopes {
-        let mut remote = envelope.remote;
-        if remote.uid == 0 {
-            synthetic_uid = synthetic_uid.saturating_add(1);
-            remote.uid = synthetic_uid;
-        }
-
-        let raw_path = persist_raw_mail(config, storage_mailbox, remote.uid, &remote.raw)?;
-        incoming.push(IncomingMail {
-            mailbox: storage_mailbox.to_string(),
-            uid: remote.uid,
-            modseq: remote.modseq,
-            flags: remote.flags,
-            raw_path,
-            parsed: envelope.parsed,
-        });
-    }
-
-    let fetched_highest_uid = incoming
-        .iter()
-        .map(|mail| mail.uid)
-        .max()
-        .unwrap_or(checkpoint_last_seen_uid);
-    let fetched_highest_modseq = incoming.iter().filter_map(|mail| mail.modseq).max();
-    let batch_highest_uid = snapshot
-        .highest_uid
-        .max(fetched_highest_uid)
-        .max(checkpoint_last_seen_uid);
-    let batch_highest_modseq = max_option(snapshot.highest_modseq, fetched_highest_modseq);
-
-    let write_result = mail_store::apply_sync_batch(
-        &config.database_path,
-        SyncBatch {
-            mailbox: storage_mailbox.to_string(),
-            uidvalidity: snapshot.uidvalidity,
-            highest_uid: batch_highest_uid,
-            highest_modseq: batch_highest_modseq,
-            mails: incoming,
-        },
+    let write_result = persist_and_write(
+        config,
+        storage_mailbox,
+        checkpoint_last_seen_uid,
+        snapshot,
+        envelopes,
+        source,
     )?;
-    if let SyncSource::Following { self_email } = source {
-        mail_store::refresh_following_updates(&config.database_path, self_email)?;
-    }
 
-    Ok(SyncSummary {
-        mailbox: mailbox.to_string(),
-        source: source.label(),
-        fetched,
-        inserted: write_result.inserted,
-        updated: write_result.updated,
-        rebuilt_roots: write_result.rebuilt_roots,
-        mailbox_rebuilt: write_result.mailbox_rebuilt,
-        uidvalidity: write_result.state.uidvalidity,
-        checkpoint_last_seen_uid: write_result.state.last_seen_uid,
-        checkpoint_highest_modseq: write_result.state.highest_modseq,
-        checkpoint_synced_at: write_result.state.synced_at.clone(),
-    })
+    Ok(build_summary(mailbox, source, fetched, write_result))
 }
 
 fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Result<SyncSummary> {
-    let storage_mailbox = storage_mailbox(mailbox, source);
-    let checkpoint = mail_store::load_mailbox_state(&config.database_path, storage_mailbox)?;
-    let checkpoint_last_seen_uid = checkpoint
-        .as_ref()
-        .map(|state| state.last_seen_uid)
-        .unwrap_or(0);
+    let storage_mailbox = source.storage_mailbox(mailbox);
+    let (checkpoint, checkpoint_last_seen_uid) = load_checkpoint(config, storage_mailbox)?;
     let mailbox_message_count =
         mail_store::mailbox_message_count(&config.database_path, storage_mailbox)?;
     // An empty mailbox gets a different startup path because paying the cost of
@@ -350,18 +331,7 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     // before the first TUI frame appears.
     let initial_window_sync = mailbox_message_count == 0;
 
-    let mut client: Box<dyn ImapClient> = match source {
-        SyncSource::Fixture {
-            fixture_dir,
-            uidvalidity_hint,
-        } => Box::new(FixtureImapClient::new(
-            fixture_dir.to_path_buf(),
-            *uidvalidity_hint,
-        )),
-        SyncSource::Following { .. } => Box::new(RemoteImapClient::new(config.imap.clone())?),
-        SyncSource::GnuArchive => Box::new(GnuArchiveClient::new(None)?),
-        SyncSource::Lore { base_url } => Box::new(LoreImapClient::new(Some(base_url))?),
-    };
+    let mut client = source.client(config)?;
 
     client.connect()?;
     let snapshot = client.select_mailbox(storage_mailbox)?;
@@ -385,77 +355,180 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     // The hidden IMAP INBOX can contain a large amount of unrelated mail. On
     // the very first fixture sync we inspect headers first so we can bound
     // startup latency and only fetch full raws for the latest patch threads.
-    let initial_inbox_selection = if initial_window_sync
-        && matches!(source, SyncSource::Fixture { .. })
-        && storage_mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
-    {
-        let header_candidates =
-            client.fetch_header_candidates(storage_mailbox, after_uid, since_modseq)?;
-        let selection = select_initial_inbox_messages(
-            storage_mailbox,
-            header_candidates,
-            INITIAL_SYNC_THREAD_LIMIT,
-        );
-        tracing::info!(
-            op = "inbox_initial_sync",
-            mailbox = %storage_mailbox,
-            status = "selected",
-            scanned = selection.scanned,
-            patch_related = selection.patch_related,
-            selected_threads = selection.selected_threads,
-            selected_messages = selection.selected_uids.len()
-        );
-        Some(selection)
-    } else {
-        None
-    };
+    let initial_inbox_selection = select_initial_inbox(
+        client.as_mut(),
+        source,
+        storage_mailbox,
+        initial_window_sync,
+        after_uid,
+        since_modseq,
+    )?;
 
-    let remote_messages = if let Some(selection) = initial_inbox_selection.as_ref() {
-        client.fetch_full_uids(storage_mailbox, &selection.selected_uids)?
-    } else if let SyncSource::Following { self_email } = source {
-        client.fetch_following_incremental(storage_mailbox, self_email, after_uid, since_modseq)?
-    } else {
-        client.fetch_incremental(storage_mailbox, after_uid, since_modseq)?
-    };
+    let remote_messages = fetch_messages(
+        client.as_mut(),
+        source,
+        storage_mailbox,
+        initial_inbox_selection.as_ref(),
+        after_uid,
+        since_modseq,
+    )?;
 
     let mut envelopes = parse_remote_messages(storage_mailbox, remote_messages);
-    if let SyncSource::Following { self_email } = source {
-        let before = envelopes.len();
-        envelopes.retain(|envelope| is_following_match(&envelope.parsed, self_email));
-        let filtered_out = before.saturating_sub(envelopes.len());
-        if filtered_out > 0 {
-            tracing::info!(
-                op = "following_filter",
-                mailbox = %storage_mailbox,
-                status = "filtered",
-                kept = envelopes.len(),
-                filtered_out
-            );
-        }
-    } else if matches!(source, SyncSource::Fixture { .. })
-        && storage_mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
-    {
-        let before = envelopes.len();
-        envelopes
-            .retain(|envelope| patch_worker::subject_is_patch_related(&envelope.parsed.subject));
-        let filtered_out = before.saturating_sub(envelopes.len());
-        if filtered_out > 0 {
-            tracing::info!(
-                op = "inbox_filter",
-                mailbox = %storage_mailbox,
-                status = "filtered",
-                rule = "patch_related",
-                kept = envelopes.len(),
-                filtered_out
-            );
-        }
-    }
+    filter_messages(&mut envelopes, source, storage_mailbox);
     if initial_window_sync && initial_inbox_selection.is_none() {
         envelopes = retain_latest_threads(envelopes, INITIAL_SYNC_THREAD_LIMIT);
     }
 
     let fetched = envelopes.len();
-    let mut incoming = Vec::with_capacity(fetched);
+    let write_result = persist_and_write(
+        config,
+        storage_mailbox,
+        checkpoint_last_seen_uid,
+        snapshot,
+        envelopes,
+        source,
+    )?;
+
+    prune_fixture_inbox(config, mailbox, storage_mailbox, source)?;
+
+    Ok(build_summary(mailbox, source, fetched, write_result))
+}
+
+fn load_checkpoint(
+    config: &RuntimeConfig,
+    mailbox: &str,
+) -> Result<(Option<mail_store::MailboxState>, u32)> {
+    let checkpoint = mail_store::load_mailbox_state(&config.database_path, mailbox)?;
+    let last_seen_uid = checkpoint
+        .as_ref()
+        .map(|state| state.last_seen_uid)
+        .unwrap_or(0);
+    Ok((checkpoint, last_seen_uid))
+}
+
+fn select_initial_inbox(
+    client: &mut dyn ImapClient,
+    source: &SyncSource,
+    mailbox: &str,
+    initial_window_sync: bool,
+    after_uid: u32,
+    since_modseq: Option<u64>,
+) -> Result<Option<InitialInboxSelection>> {
+    if !initial_window_sync || !source.is_fixture() || !is_inbox(mailbox) {
+        return Ok(None);
+    }
+
+    let header_candidates = client.fetch_header_candidates(mailbox, after_uid, since_modseq)?;
+    let selection =
+        select_initial_inbox_messages(mailbox, header_candidates, INITIAL_SYNC_THREAD_LIMIT);
+    tracing::info!(
+        op = "inbox_initial_sync",
+        mailbox = %mailbox,
+        status = "selected",
+        scanned = selection.scanned,
+        patch_related = selection.patch_related,
+        selected_threads = selection.selected_threads,
+        selected_messages = selection.selected_uids.len()
+    );
+    Ok(Some(selection))
+}
+
+fn fetch_messages(
+    client: &mut dyn ImapClient,
+    source: &SyncSource,
+    mailbox: &str,
+    initial_selection: Option<&InitialInboxSelection>,
+    after_uid: u32,
+    since_modseq: Option<u64>,
+) -> Result<Vec<RemoteMail>> {
+    if let Some(selection) = initial_selection {
+        return client.fetch_full_uids(mailbox, &selection.selected_uids);
+    }
+
+    if let SyncSource::Following { self_email } = source {
+        return client.fetch_following_incremental(mailbox, self_email, after_uid, since_modseq);
+    }
+
+    client.fetch_incremental(mailbox, after_uid, since_modseq)
+}
+
+fn filter_messages(envelopes: &mut Vec<RemoteMailEnvelope>, source: &SyncSource, mailbox: &str) {
+    if let SyncSource::Following { self_email } = source {
+        let before = envelopes.len();
+        envelopes.retain(|envelope| is_following_match(&envelope.parsed, self_email));
+        log_filter_result("following_filter", mailbox, envelopes.len(), before);
+        return;
+    }
+
+    if source.is_fixture() && is_inbox(mailbox) {
+        let before = envelopes.len();
+        envelopes
+            .retain(|envelope| patch_worker::subject_is_patch_related(&envelope.parsed.subject));
+        log_filter_result("inbox_filter", mailbox, envelopes.len(), before);
+    }
+}
+
+fn log_filter_result(operation: &str, mailbox: &str, kept: usize, before: usize) {
+    let filtered_out = before.saturating_sub(kept);
+    if filtered_out == 0 {
+        return;
+    }
+
+    tracing::info!(
+        op = operation,
+        mailbox = %mailbox,
+        status = "filtered",
+        kept,
+        filtered_out
+    );
+}
+
+fn persist_and_write(
+    config: &RuntimeConfig,
+    mailbox: &str,
+    checkpoint_last_seen_uid: u32,
+    snapshot: MailboxSnapshot,
+    envelopes: Vec<RemoteMailEnvelope>,
+    source: &SyncSource,
+) -> Result<mail_store::SyncWriteResult> {
+    let incoming = build_incoming_mail(config, mailbox, checkpoint_last_seen_uid, envelopes)?;
+    let fetched_highest_uid = incoming
+        .iter()
+        .map(|mail| mail.uid)
+        .max()
+        .unwrap_or(checkpoint_last_seen_uid);
+    let fetched_highest_modseq = incoming.iter().filter_map(|mail| mail.modseq).max();
+
+    let write_result = mail_store::apply_sync_batch(
+        &config.database_path,
+        SyncBatch {
+            mailbox: mailbox.to_string(),
+            uidvalidity: snapshot.uidvalidity,
+            highest_uid: snapshot
+                .highest_uid
+                .max(fetched_highest_uid)
+                .max(checkpoint_last_seen_uid),
+            // Keep checkpoint progress monotonic even when the selected fetch
+            // window is intentionally partial.
+            highest_modseq: max_option(snapshot.highest_modseq, fetched_highest_modseq),
+            mails: incoming,
+        },
+    )?;
+
+    if let SyncSource::Following { self_email } = source {
+        mail_store::refresh_following_updates(&config.database_path, self_email)?;
+    }
+
+    Ok(write_result)
+}
+
+fn build_incoming_mail(
+    config: &RuntimeConfig,
+    mailbox: &str,
+    checkpoint_last_seen_uid: u32,
+    envelopes: Vec<RemoteMailEnvelope>,
+) -> Result<Vec<IncomingMail>> {
+    let mut incoming = Vec::with_capacity(envelopes.len());
     let mut synthetic_uid = checkpoint_last_seen_uid;
 
     for envelope in envelopes {
@@ -468,10 +541,9 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
             remote.uid = synthetic_uid;
         }
 
-        let raw_path = persist_raw_mail(config, storage_mailbox, remote.uid, &remote.raw)?;
-
+        let raw_path = persist_raw_mail(config, mailbox, remote.uid, &remote.raw)?;
         incoming.push(IncomingMail {
-            mailbox: storage_mailbox.to_string(),
+            mailbox: mailbox.to_string(),
             uid: remote.uid,
             modseq: remote.modseq,
             flags: remote.flags,
@@ -480,57 +552,51 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         });
     }
 
-    let fetched_highest_uid = incoming
-        .iter()
-        .map(|mail| mail.uid)
-        .max()
-        .unwrap_or(checkpoint_last_seen_uid);
-    let fetched_highest_modseq = incoming.iter().filter_map(|mail| mail.modseq).max();
+    Ok(incoming)
+}
 
-    let batch_highest_uid = snapshot
-        .highest_uid
-        .max(fetched_highest_uid)
-        .max(checkpoint_last_seen_uid);
+fn prune_fixture_inbox(
+    config: &RuntimeConfig,
+    mailbox: &str,
+    storage_mailbox: &str,
+    source: &SyncSource,
+) -> Result<()> {
+    if !source.is_fixture() || !is_inbox(storage_mailbox) {
+        return Ok(());
+    }
 
-    // Keep checkpoint progress monotonic even when the selected fetch window is
-    // intentionally partial, such as the initial inbox optimization.
-    let batch_highest_modseq = max_option(snapshot.highest_modseq, fetched_highest_modseq);
-
-    let write_result = mail_store::apply_sync_batch(
+    // The initial header scan is only an optimization. Pruning after the write
+    // keeps later incremental syncs from slowly reintroducing unrelated mail
+    // into the patch-focused inbox view.
+    let pruned = mail_store::prune_mailbox_subjects(
         &config.database_path,
-        SyncBatch {
-            mailbox: storage_mailbox.to_string(),
-            uidvalidity: snapshot.uidvalidity,
-            highest_uid: batch_highest_uid,
-            highest_modseq: batch_highest_modseq,
-            mails: incoming,
-        },
+        mailbox,
+        patch_worker::subject_is_patch_related,
     )?;
-    if let SyncSource::Following { self_email } = source {
-        mail_store::refresh_following_updates(&config.database_path, self_email)?;
-    }
-    if matches!(source, SyncSource::Fixture { .. })
-        && storage_mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
-    {
-        // The initial header scan is only an optimization. Pruning after the
-        // write keeps later incremental syncs from slowly reintroducing
-        // unrelated mail into the patch-focused inbox view.
-        let pruned =
-            mail_store::prune_mailbox_subjects(&config.database_path, mailbox, |subject| {
-                patch_worker::subject_is_patch_related(subject)
-            })?;
-        if pruned > 0 {
-            tracing::info!(
-                op = "inbox_filter",
-                mailbox = %storage_mailbox,
-                status = "pruned",
-                rule = "patch_related",
-                pruned
-            );
-        }
+    if pruned > 0 {
+        tracing::info!(
+            op = "inbox_filter",
+            mailbox = %storage_mailbox,
+            status = "pruned",
+            rule = "patch_related",
+            pruned
+        );
     }
 
-    Ok(SyncSummary {
+    Ok(())
+}
+
+fn is_inbox(mailbox: &str) -> bool {
+    mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
+}
+
+fn build_summary(
+    mailbox: &str,
+    source: &SyncSource,
+    fetched: usize,
+    write_result: mail_store::SyncWriteResult,
+) -> SyncSummary {
+    SyncSummary {
         mailbox: mailbox.to_string(),
         source: source.label(),
         fetched,
@@ -541,8 +607,8 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         uidvalidity: write_result.state.uidvalidity,
         checkpoint_last_seen_uid: write_result.state.last_seen_uid,
         checkpoint_highest_modseq: write_result.state.highest_modseq,
-        checkpoint_synced_at: write_result.state.synced_at.clone(),
-    })
+        checkpoint_synced_at: write_result.state.synced_at,
+    }
 }
 
 fn parse_remote_messages(
@@ -790,11 +856,7 @@ fn persist_raw_mail(
 }
 
 fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(l), Some(r)) => Some(l.max(r)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
+    left.max(right)
 }
 
 #[cfg(test)]

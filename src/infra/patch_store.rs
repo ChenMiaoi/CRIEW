@@ -7,10 +7,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
 use crate::domain::models::PatchSeriesStatus;
 use crate::infra::error::{CriewError, ErrorCode, Result};
+use crate::infra::sqlite::open as open_connection;
 
 #[derive(Debug, Clone)]
 pub struct UpsertSeriesRequest {
@@ -467,28 +468,6 @@ LIMIT 1
         last_exit_code,
         last_summary,
     }))
-}
-
-fn open_connection(path: &Path) -> Result<Connection> {
-    let connection = Connection::open(path).map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Database,
-            format!("failed to open sqlite database {}", path.display()),
-            error,
-        )
-    })?;
-
-    connection
-        .execute_batch("PRAGMA foreign_keys = ON;")
-        .map_err(|error| {
-            CriewError::with_source(
-                ErrorCode::Database,
-                "failed to enable sqlite foreign key support",
-                error,
-            )
-        })?;
-
-    Ok(connection)
 }
 
 fn join_seq(values: &[u32]) -> String {

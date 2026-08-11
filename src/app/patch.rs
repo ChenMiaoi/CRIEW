@@ -235,6 +235,25 @@ struct CandidatePatch<'a> {
     sort_ord: usize,
 }
 
+struct PreparedAction {
+    record_id: i64,
+    working_dir: Option<PathBuf>,
+    baseline_head: Option<String>,
+    apply_artifacts_before: Option<HashSet<String>>,
+    args: Vec<String>,
+    output_path: Option<PathBuf>,
+    fallback_command: String,
+}
+
+struct ActionOutcome {
+    output: b4::B4CommandResult,
+    status: PatchSeriesStatus,
+    summary: String,
+    output_path: Option<PathBuf>,
+    head_before: Option<String>,
+    head_after: Option<String>,
+}
+
 pub fn build_series_index(mailbox: &str, threads: &[ThreadRow]) -> HashMap<i64, SeriesSummary> {
     let mut rows_by_thread: HashMap<i64, Vec<(usize, &ThreadRow)>> = HashMap::new();
     for (index, row) in threads.iter().enumerate() {
@@ -568,6 +587,63 @@ pub fn run_action(
     summary: &SeriesSummary,
     action: PatchAction,
 ) -> Result<PatchActionResult> {
+    let prepared = prepare_action(runtime, summary, action)?;
+    let output = match b4::run(
+        runtime.b4_path.as_deref(),
+        Some(&runtime.data_dir),
+        action_subcommand(action),
+        &prepared.args,
+        B4_ACTION_TIMEOUT,
+        prepared.working_dir.as_deref(),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            record_action_failure(runtime, action, &prepared, &error)?;
+            return Err(error);
+        }
+    };
+
+    let apply_artifact_dir = relocate_apply_artifacts(runtime, summary, action, &prepared)?;
+    let mut output_path = prepared.output_path.clone();
+    if output_path.is_none() {
+        output_path = apply_artifact_dir.clone();
+    }
+
+    let (mut status, mut summary_line) = map_b4_result(action, &output, output_path.as_deref());
+    let (applied_head_before, applied_head_after) = verify_apply_head_movement(
+        action,
+        &mut status,
+        &mut summary_line,
+        prepared.working_dir.as_deref(),
+        prepared.baseline_head.as_deref(),
+    );
+    if matches!(action, PatchAction::Apply)
+        && status == PatchSeriesStatus::Applied
+        && let Some(path) = apply_artifact_dir.as_deref()
+    {
+        summary_line = format!("{summary_line}; artifacts moved to {}", path.display());
+    }
+
+    record_action_result(
+        runtime,
+        action,
+        prepared.record_id,
+        ActionOutcome {
+            output,
+            status,
+            summary: summary_line,
+            output_path,
+            head_before: applied_head_before,
+            head_after: applied_head_after,
+        },
+    )
+}
+
+fn prepare_action(
+    runtime: &RuntimeConfig,
+    summary: &SeriesSummary,
+    action: PatchAction,
+) -> Result<PreparedAction> {
     if !summary.integrity.is_ready() {
         let reason = summary
             .integrity_reason()
@@ -578,41 +654,33 @@ pub fn run_action(
         ));
     }
 
-    let record = patch_store::upsert_series(
-        &runtime.database_path,
-        &patch_store::UpsertSeriesRequest {
-            mailbox: summary.mailbox.clone(),
-            thread_id: summary.thread_id,
-            version: summary.version,
-            expected_total: summary.expected_total,
-            author: summary.author.clone(),
-            subject: summary.subject.clone(),
-            anchor_message_id: summary.anchor_message_id.clone(),
-            integrity: summary.integrity.as_str().to_string(),
-            missing_seq: summary.missing_seq.clone(),
-            duplicate_seq: summary.duplicate_seq.clone(),
-            out_of_order: summary.out_of_order,
-            items: summary
-                .items
-                .iter()
-                .map(|item| patch_store::UpsertSeriesItem {
-                    seq: item.seq,
-                    total: item.total,
-                    mail_id: item.mail_id,
-                    message_id: item.message_id.clone(),
-                    subject: item.subject.clone(),
-                    raw_path: item.raw_path.clone(),
-                    sort_ord: item.sort_ord,
-                })
-                .collect(),
-        },
-    )?;
+    let record = upsert_series_summary(runtime, summary)?;
 
     // Mark the series as actively being worked on before spawning `b4` so the
     // UI reflects in-flight intent even if the external process later fails.
+    mark_series_reviewing(runtime, record.id)?;
+
+    let working_dir = action_working_dir(runtime, action)?;
+    let (baseline_head, apply_artifacts_before) =
+        prepare_apply_state(action, working_dir.as_deref())?;
+    let mut output_path = None;
+    let args = action_args(runtime, summary, action, &mut output_path)?;
+    let fallback_command = fallback_command_line("b4", action_subcommand(action), &args);
+    Ok(PreparedAction {
+        record_id: record.id,
+        working_dir,
+        baseline_head,
+        apply_artifacts_before,
+        args,
+        output_path,
+        fallback_command,
+    })
+}
+
+fn mark_series_reviewing(runtime: &RuntimeConfig, series_id: i64) -> Result<()> {
     patch_store::update_series_result(
         &runtime.database_path,
-        record.id,
+        series_id,
         &patch_store::SeriesResultUpdate {
             status: PatchSeriesStatus::Reviewing,
             last_error: None,
@@ -622,144 +690,153 @@ pub fn run_action(
             last_stderr: None,
             output_path: None,
         },
-    )?;
+    )
+}
 
-    let working_dir = action_working_dir(runtime, action)?;
-    let baseline_head = if matches!(action, PatchAction::Apply) {
-        let Some(path) = working_dir.as_deref() else {
-            return Err(CriewError::new(
-                ErrorCode::Command,
-                "apply requires [kernel].tree to be configured",
-            ));
-        };
-        Some(resolve_git_head(path)?)
-    } else {
-        None
-    };
-    let mut output_path: Option<PathBuf> = None;
-    let apply_artifacts_before = if matches!(action, PatchAction::Apply) {
-        // Snapshot existing artifacts so we only relocate files created by this
-        // apply run, not unrelated leftovers already present in the tree.
-        working_dir
-            .as_deref()
-            .map(snapshot_apply_artifacts)
-            .transpose()?
-    } else {
-        None
-    };
-    let args = action_args(runtime, summary, action, &mut output_path)?;
-    let subcommand = action_subcommand(action);
-    let fallback_command = fallback_command_line("b4", subcommand, &args);
+fn prepare_apply_state(
+    action: PatchAction,
+    working_dir: Option<&Path>,
+) -> Result<(Option<String>, Option<HashSet<String>>)> {
+    if !matches!(action, PatchAction::Apply) {
+        return Ok((None, None));
+    }
 
-    let output = match b4::run(
-        runtime.b4_path.as_deref(),
-        Some(&runtime.data_dir),
-        subcommand,
-        &args,
-        B4_ACTION_TIMEOUT,
-        working_dir.as_deref(),
+    let Some(path) = working_dir else {
+        return Err(CriewError::new(
+            ErrorCode::Command,
+            "apply requires [kernel].tree to be configured",
+        ));
+    };
+
+    // Snapshot existing artifacts so we only relocate files created by this
+    // apply run, not unrelated leftovers already present in the tree.
+    Ok((
+        Some(resolve_git_head(path)?),
+        Some(snapshot_apply_artifacts(path)?),
+    ))
+}
+
+fn relocate_apply_artifacts(
+    runtime: &RuntimeConfig,
+    summary: &SeriesSummary,
+    action: PatchAction,
+    prepared: &PreparedAction,
+) -> Result<Option<PathBuf>> {
+    if !matches!(action, PatchAction::Apply) {
+        return Ok(None);
+    }
+
+    match (
+        prepared.working_dir.as_deref(),
+        prepared.apply_artifacts_before.as_ref(),
     ) {
-        Ok(output) => output,
+        (Some(path), Some(before)) => {
+            relocate_new_apply_artifacts(path, before, &runtime.patch_dir, summary)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn verify_apply_head_movement(
+    action: PatchAction,
+    status: &mut PatchSeriesStatus,
+    summary_line: &mut String,
+    working_dir: Option<&Path>,
+    baseline_head: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if !matches!(action, PatchAction::Apply) || *status != PatchSeriesStatus::Applied {
+        return (None, None);
+    }
+
+    let (Some(path), Some(before_head)) = (working_dir, baseline_head) else {
+        return (None, None);
+    };
+    // A zero exit code is not enough for apply: verify that git history
+    // actually moved so "no-op success" does not look like a real apply.
+    match resolve_git_head(path) {
+        Ok(after_head) if after_head == before_head => {
+            *status = PatchSeriesStatus::Failed;
+            *summary_line =
+                "b4 shazam exited successfully, but git HEAD did not move (no new commit in git log)"
+                    .to_string();
+            (None, None)
+        }
+        Ok(after_head) => (Some(before_head.to_string()), Some(after_head)),
         Err(error) => {
-            let message = error.to_string();
-            patch_store::update_series_result(
-                &runtime.database_path,
-                record.id,
-                &patch_store::SeriesResultUpdate {
-                    status: PatchSeriesStatus::Failed,
-                    last_error: Some(message.clone()),
-                    last_command: Some(fallback_command.clone()),
-                    last_exit_code: None,
-                    last_stdout: None,
-                    last_stderr: None,
-                    output_path: output_path.clone(),
-                },
-            )?;
-            patch_store::insert_series_run(
-                &runtime.database_path,
-                &patch_store::SeriesRunRequest {
-                    series_id: record.id,
-                    action: action.name().to_string(),
-                    command: fallback_command.clone(),
-                    status: "failed".to_string(),
-                    exit_code: None,
-                    timed_out: false,
-                    summary: Some(message.clone()),
-                    stdout: None,
-                    stderr: Some(message.clone()),
-                    output_path: output_path.clone(),
-                },
-            )?;
-            return Err(error);
+            *status = PatchSeriesStatus::Failed;
+            *summary_line = format!("apply verification failed: {error}");
+            (None, None)
         }
-    };
+    }
+}
 
-    let apply_artifact_dir = if matches!(action, PatchAction::Apply) {
-        if let (Some(path), Some(before)) =
-            (working_dir.as_deref(), apply_artifacts_before.as_ref())
-        {
-            relocate_new_apply_artifacts(path, before, &runtime.patch_dir, summary)?
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    if output_path.is_none() {
-        output_path = apply_artifact_dir.clone();
-    }
+fn record_action_failure(
+    runtime: &RuntimeConfig,
+    action: PatchAction,
+    prepared: &PreparedAction,
+    error: &CriewError,
+) -> Result<()> {
+    let message = error.to_string();
+    patch_store::update_series_result(
+        &runtime.database_path,
+        prepared.record_id,
+        &patch_store::SeriesResultUpdate {
+            status: PatchSeriesStatus::Failed,
+            last_error: Some(message.clone()),
+            last_command: Some(prepared.fallback_command.clone()),
+            last_exit_code: None,
+            last_stdout: None,
+            last_stderr: None,
+            output_path: prepared.output_path.clone(),
+        },
+    )?;
+    patch_store::insert_series_run(
+        &runtime.database_path,
+        &patch_store::SeriesRunRequest {
+            series_id: prepared.record_id,
+            action: action.name().to_string(),
+            command: prepared.fallback_command.clone(),
+            status: "failed".to_string(),
+            exit_code: None,
+            timed_out: false,
+            summary: Some(message.clone()),
+            stdout: None,
+            stderr: Some(message),
+            output_path: prepared.output_path.clone(),
+        },
+    )?;
+    Ok(())
+}
 
-    let (mut status, mut summary_line) = map_b4_result(action, &output, output_path.as_deref());
-    let mut applied_head_before: Option<String> = None;
-    let mut applied_head_after: Option<String> = None;
-    if matches!(action, PatchAction::Apply)
-        && status == PatchSeriesStatus::Applied
-        && let (Some(path), Some(before_head)) = (working_dir.as_deref(), baseline_head.as_deref())
-    {
-        // A zero exit code is not enough for apply: verify that git history
-        // actually moved so "no-op success" does not look like a real apply.
-        match resolve_git_head(path) {
-            Ok(after_head) => {
-                if after_head == *before_head {
-                    status = PatchSeriesStatus::Failed;
-                    summary_line =
-                        "b4 shazam exited successfully, but git HEAD did not move (no new commit in git log)"
-                            .to_string();
-                } else {
-                    applied_head_before = Some(before_head.to_string());
-                    applied_head_after = Some(after_head);
-                }
-            }
-            Err(error) => {
-                status = PatchSeriesStatus::Failed;
-                summary_line = format!("apply verification failed: {error}");
-            }
-        }
-    }
-    if matches!(action, PatchAction::Apply)
-        && status == PatchSeriesStatus::Applied
-        && let Some(path) = apply_artifact_dir.as_deref()
-    {
-        summary_line = format!("{summary_line}; artifacts moved to {}", path.display());
-    }
+fn record_action_result(
+    runtime: &RuntimeConfig,
+    action: PatchAction,
+    series_id: i64,
+    outcome: ActionOutcome,
+) -> Result<PatchActionResult> {
+    let ActionOutcome {
+        output,
+        status,
+        summary,
+        output_path,
+        head_before,
+        head_after,
+    } = outcome;
     let command_line = output.command_line.clone();
     let truncated_stdout = truncate_output(&output.stdout);
     let truncated_stderr = truncate_output(&output.stderr);
-    let last_error = if matches!(
+    let last_error = (!matches!(
         status,
         PatchSeriesStatus::Applied | PatchSeriesStatus::Reviewing
-    ) {
-        None
-    } else {
-        Some(summary_line.as_str())
-    };
+    ))
+    .then(|| summary.clone());
 
     patch_store::update_series_result(
         &runtime.database_path,
-        record.id,
+        series_id,
         &patch_store::SeriesResultUpdate {
             status,
-            last_error: last_error.map(ToOwned::to_owned),
+            last_error,
             last_command: Some(command_line.clone()),
             last_exit_code: output.exit_code,
             last_stdout: Some(truncated_stdout.clone()),
@@ -771,13 +848,13 @@ pub fn run_action(
     patch_store::insert_series_run(
         &runtime.database_path,
         &patch_store::SeriesRunRequest {
-            series_id: record.id,
+            series_id,
             action: action.name().to_string(),
             command: command_line.clone(),
             status: status_to_label(status).to_string(),
             exit_code: output.exit_code,
             timed_out: output.timed_out,
-            summary: Some(summary_line.clone()),
+            summary: Some(summary.clone()),
             stdout: Some(truncated_stdout),
             stderr: Some(truncated_stderr),
             output_path: output_path.clone(),
@@ -786,13 +863,13 @@ pub fn run_action(
 
     Ok(PatchActionResult {
         status,
-        summary: summary_line,
+        summary,
         command_line,
         exit_code: output.exit_code,
         timed_out: output.timed_out,
         output_path,
-        head_before: applied_head_before,
-        head_after: applied_head_after,
+        head_before,
+        head_after,
     })
 }
 

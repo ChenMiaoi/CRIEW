@@ -141,7 +141,7 @@ fn run_with_resolved_program(
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let command_line = render_program_command_line(&resolved.command, args);
-    let mut child = spawn_command_with_retry(&mut command).map_err(|error| {
+    let child = spawn_command_with_retry(&mut command).map_err(|error| {
         CriewError::with_source(
             ErrorCode::B4,
             format!(
@@ -153,6 +153,44 @@ fn run_with_resolved_program(
         )
     })?;
 
+    let (output, timed_out) = wait_for_command(child, timeout).map_err(|error| match error {
+        ProcessWaitError::Polling(error) => CriewError::with_source(
+            ErrorCode::B4,
+            format!(
+                "failed while waiting for external command '{}'",
+                command_line
+            ),
+            error,
+        ),
+        ProcessWaitError::Collecting(error) => CriewError::with_source(
+            ErrorCode::B4,
+            format!(
+                "failed to collect output for external command '{}'",
+                command_line
+            ),
+            error,
+        ),
+    })?;
+
+    Ok(B4CommandResult {
+        command_line,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code(),
+        timed_out,
+    })
+}
+
+#[derive(Debug)]
+enum ProcessWaitError {
+    Polling(std::io::Error),
+    Collecting(std::io::Error),
+}
+
+fn wait_for_command(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> std::result::Result<(std::process::Output, bool), ProcessWaitError> {
     let started_at = Instant::now();
     let mut timed_out = false;
 
@@ -169,37 +207,14 @@ fn run_with_resolved_program(
                 }
                 thread::sleep(Duration::from_millis(30));
             }
-            Err(error) => {
-                return Err(CriewError::with_source(
-                    ErrorCode::B4,
-                    format!(
-                        "failed while waiting for external command '{}'",
-                        command_line
-                    ),
-                    error,
-                ));
-            }
+            Err(error) => return Err(ProcessWaitError::Polling(error)),
         }
     }
 
-    let output = child.wait_with_output().map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::B4,
-            format!(
-                "failed to collect output for external command '{}'",
-                command_line
-            ),
-            error,
-        )
-    })?;
-
-    Ok(B4CommandResult {
-        command_line,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code(),
-        timed_out,
-    })
+    child
+        .wait_with_output()
+        .map(|output| (output, timed_out))
+        .map_err(ProcessWaitError::Collecting)
 }
 
 fn candidates(configured_path: Option<&Path>, runtime_data_dir: Option<&Path>) -> Vec<Candidate> {
@@ -286,18 +301,7 @@ fn probe(candidate: &Candidate) -> Probe {
 }
 
 fn spawn_command_with_retry(command: &mut Command) -> std::io::Result<std::process::Child> {
-    let mut attempts_remaining = EXECUTABLE_BUSY_RETRY_ATTEMPTS;
-
-    loop {
-        match command.spawn() {
-            Ok(child) => return Ok(child),
-            Err(error) if is_retryable_executable_busy(&error) && attempts_remaining > 0 => {
-                attempts_remaining -= 1;
-                thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    retry_executable_busy(|| command.spawn())
 }
 
 fn run_probe<T>(command: T, label: &Path, command_value: String) -> Probe
@@ -335,11 +339,18 @@ where
 }
 
 fn output_with_retry(command: &mut Command) -> std::io::Result<std::process::Output> {
+    retry_executable_busy(|| command.output())
+}
+
+fn retry_executable_busy<T, F>(mut operation: F) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
     let mut attempts_remaining = EXECUTABLE_BUSY_RETRY_ATTEMPTS;
 
     loop {
-        match command.output() {
-            Ok(output) => return Ok(output),
+        match operation() {
+            Ok(value) => return Ok(value),
             Err(error) if is_retryable_executable_busy(&error) && attempts_remaining > 0 => {
                 attempts_remaining -= 1;
                 thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);

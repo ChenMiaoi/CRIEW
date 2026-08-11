@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, params};
 
 use crate::infra::error::{CriewError, ErrorCode, Result};
+use crate::infra::sqlite;
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
@@ -79,23 +80,7 @@ pub struct DatabaseState {
 
 pub fn initialize(path: &Path) -> Result<DatabaseState> {
     let created = !path.exists();
-    let mut connection = Connection::open(path).map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Database,
-            format!("failed to open sqlite database {}", path.display()),
-            error,
-        )
-    })?;
-
-    connection
-        .execute_batch("PRAGMA foreign_keys = ON;")
-        .map_err(|error| {
-            CriewError::with_source(
-                ErrorCode::Database,
-                "failed to enable sqlite foreign key support",
-                error,
-            )
-        })?;
+    let mut connection = sqlite::open(path)?;
 
     connection
         .execute_batch(CREATE_SCHEMA_VERSION_TABLE)

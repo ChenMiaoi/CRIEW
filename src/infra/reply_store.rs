@@ -5,9 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
 use crate::infra::error::{CriewError, ErrorCode, Result};
+use crate::infra::sqlite::open as open_connection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyDraftStatus {
@@ -552,16 +553,6 @@ fn map_reply_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplyDraft> {
         draft_path: row.get::<_, Option<String>>(12)?.map(PathBuf::from),
         last_error: row.get::<_, Option<String>>(13)?,
         updated_at: row.get::<_, String>(14)?,
-    })
-}
-
-fn open_connection(path: &Path) -> Result<Connection> {
-    Connection::open(path).map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Database,
-            format!("failed to open sqlite database {}", path.display()),
-            error,
-        )
     })
 }
 

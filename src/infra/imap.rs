@@ -144,17 +144,6 @@ impl FixtureImapClient {
         }
     }
 
-    fn ensure_connected(&self) -> Result<()> {
-        if self.connected {
-            return Ok(());
-        }
-
-        Err(imap_error(
-            ImapErrorKind::Connection,
-            "client is not connected",
-        ))
-    }
-
     fn read_uidvalidity(&self, mailbox: &str) -> Result<u64> {
         let path = self.mailbox_dir(mailbox).join(".uidvalidity");
         if !path.exists() {
@@ -281,7 +270,7 @@ impl ImapClient for FixtureImapClient {
     }
 
     fn select_mailbox(&mut self, mailbox: &str) -> Result<MailboxSnapshot> {
-        self.ensure_connected()?;
+        require_connected(self.connected)?;
 
         let uidvalidity = self.read_uidvalidity(mailbox)?;
         let entries = self.scan_entries(mailbox)?;
@@ -302,7 +291,7 @@ impl ImapClient for FixtureImapClient {
         after_uid: u32,
         since_modseq: Option<u64>,
     ) -> Result<Vec<RemoteMail>> {
-        self.ensure_connected()?;
+        require_connected(self.connected)?;
 
         let entries = self.scan_entries(mailbox)?;
         let mut fetched = Vec::new();
@@ -380,17 +369,6 @@ impl LoreImapClient {
             connected: false,
             client,
         })
-    }
-
-    fn ensure_connected(&self) -> Result<()> {
-        if self.connected {
-            return Ok(());
-        }
-
-        Err(imap_error(
-            ImapErrorKind::Connection,
-            "client is not connected",
-        ))
     }
 
     fn feed_url(&self, mailbox: &str) -> String {
@@ -593,7 +571,7 @@ impl ImapClient for LoreImapClient {
     }
 
     fn select_mailbox(&mut self, mailbox: &str) -> Result<MailboxSnapshot> {
-        self.ensure_connected()?;
+        require_connected(self.connected)?;
         let entries = self.fetch_feed_entries(mailbox)?;
         let highest_modseq = entries.iter().map(|entry| entry.modseq).max();
 
@@ -610,7 +588,7 @@ impl ImapClient for LoreImapClient {
         _after_uid: u32,
         since_modseq: Option<u64>,
     ) -> Result<Vec<RemoteMail>> {
-        self.ensure_connected()?;
+        require_connected(self.connected)?;
         let entries = self.fetch_feed_entries(mailbox)?;
         build_lore_incremental_mails(entries, since_modseq, |message_url| {
             self.fetch_raw_mail(message_url)
@@ -618,7 +596,7 @@ impl ImapClient for LoreImapClient {
     }
 
     fn fetch_thread(&mut self, mailbox: &str, message_id: &str) -> Result<Vec<RemoteMail>> {
-        self.ensure_connected()?;
+        require_connected(self.connected)?;
         let raw_mbox = self.fetch_thread_mbox(mailbox, message_id)?;
         let messages = parse_gnu_archive_mbox_messages(&raw_mbox);
         let mut remote = Vec::with_capacity(messages.len());
@@ -671,17 +649,6 @@ impl GnuArchiveClient {
             connected: false,
             client,
         })
-    }
-
-    fn ensure_connected(&self) -> Result<()> {
-        if self.connected {
-            return Ok(());
-        }
-
-        Err(imap_error(
-            ImapErrorKind::Connection,
-            "client is not connected",
-        ))
     }
 
     fn index_url(&self, mailbox: &str) -> String {
@@ -811,7 +778,7 @@ impl ImapClient for GnuArchiveClient {
     }
 
     fn select_mailbox(&mut self, mailbox: &str) -> Result<MailboxSnapshot> {
-        self.ensure_connected()?;
+        require_connected(self.connected)?;
         let entries = self.fetch_month_entries(mailbox)?;
         let highest_modseq = entries.iter().map(|entry| entry.modseq).max();
 
@@ -828,7 +795,7 @@ impl ImapClient for GnuArchiveClient {
         _after_uid: u32,
         since_modseq: Option<u64>,
     ) -> Result<Vec<RemoteMail>> {
-        self.ensure_connected()?;
+        require_connected(self.connected)?;
         let months = self.fetch_month_entries(mailbox)?;
         build_gnu_archive_incremental_mails(&months, since_modseq, |month_key| {
             self.fetch_month_mbox(mailbox, month_key)
@@ -865,6 +832,12 @@ impl RemoteImapClient {
             )
         })
     }
+
+    fn selected_session(&mut self, mailbox: &str) -> Result<(&mut ImapSession, MailboxSnapshot)> {
+        let session = self.session_mut()?;
+        let snapshot = session.select_mailbox(mailbox)?;
+        Ok((session, snapshot))
+    }
 }
 
 impl ImapClient for RemoteImapClient {
@@ -884,8 +857,7 @@ impl ImapClient for RemoteImapClient {
         after_uid: u32,
         since_modseq: Option<u64>,
     ) -> Result<Vec<RemoteMail>> {
-        let session = self.session_mut()?;
-        let snapshot = session.select_mailbox(mailbox)?;
+        let (session, snapshot) = self.selected_session(mailbox)?;
         let uids = collect_incremental_uids(session, snapshot, after_uid, since_modseq)?;
         session.fetch_uids(&uids, "BODY.PEEK[]")
     }
@@ -896,8 +868,7 @@ impl ImapClient for RemoteImapClient {
         after_uid: u32,
         since_modseq: Option<u64>,
     ) -> Result<Vec<RemoteMail>> {
-        let session = self.session_mut()?;
-        let snapshot = session.select_mailbox(mailbox)?;
+        let (session, snapshot) = self.selected_session(mailbox)?;
         let uids = collect_incremental_uids(session, snapshot, after_uid, since_modseq)?;
         session.fetch_uids(
             &uids,
@@ -912,8 +883,7 @@ impl ImapClient for RemoteImapClient {
         after_uid: u32,
         since_modseq: Option<u64>,
     ) -> Result<Vec<RemoteMail>> {
-        let session = self.session_mut()?;
-        let snapshot = session.select_mailbox(mailbox)?;
+        let (session, snapshot) = self.selected_session(mailbox)?;
         let incremental_uids =
             collect_incremental_uids(session, snapshot, after_uid, since_modseq)?;
         if incremental_uids.is_empty() {
@@ -935,14 +905,12 @@ impl ImapClient for RemoteImapClient {
     }
 
     fn fetch_full_uids(&mut self, mailbox: &str, uids: &[u32]) -> Result<Vec<RemoteMail>> {
-        let session = self.session_mut()?;
-        let _ = session.select_mailbox(mailbox)?;
+        let (session, _) = self.selected_session(mailbox)?;
         session.fetch_uids(uids, "BODY.PEEK[]")
     }
 
     fn fetch_thread(&mut self, mailbox: &str, message_id: &str) -> Result<Vec<RemoteMail>> {
-        let session = self.session_mut()?;
-        let _ = session.select_mailbox(mailbox)?;
+        let (session, _) = self.selected_session(mailbox)?;
 
         let mut pending_ids = vec![normalize_requested_message_id(message_id)];
         let mut seen_ids = HashSet::new();
@@ -2549,6 +2517,17 @@ fn imap_error(kind: ImapErrorKind, message: impl Into<String>) -> CriewError {
         ErrorCode::Imap,
         format!("{}: {}", classify(kind), message.into()),
     )
+}
+
+fn require_connected(connected: bool) -> Result<()> {
+    if connected {
+        return Ok(());
+    }
+
+    Err(imap_error(
+        ImapErrorKind::Connection,
+        "client is not connected",
+    ))
 }
 
 fn classify(kind: ImapErrorKind) -> &'static str {

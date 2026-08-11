@@ -9,7 +9,7 @@ pub mod review;
 pub mod sync;
 pub mod update;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -51,19 +51,38 @@ pub fn run() -> Result<()> {
     let mut bootstrap_state = bootstrap::prepare(&runtime)?;
 
     match command {
-        cli::Command::Tui => loop {
-            match crate::ui::run(&runtime, &bootstrap_state)? {
-                crate::ui::TuiAction::Exit => break Ok(()),
-                crate::ui::TuiAction::Restart => {
-                    tracing::info!(
-                        config_path = %startup_config_path.display(),
-                        "user requested tui restart"
-                    );
-                    runtime = config::load(Some(startup_config_path.as_path()))?;
-                    bootstrap_state = bootstrap::prepare(&runtime)?;
-                }
+        cli::Command::Tui => run_tui(&mut runtime, &mut bootstrap_state, &startup_config_path),
+        command => run_cli_command(command, &runtime, &bootstrap_state),
+    }
+}
+
+fn run_tui(
+    runtime: &mut config::RuntimeConfig,
+    bootstrap_state: &mut bootstrap::BootstrapState,
+    startup_config_path: &Path,
+) -> Result<()> {
+    loop {
+        match crate::ui::run(runtime, bootstrap_state)? {
+            crate::ui::TuiAction::Exit => break Ok(()),
+            crate::ui::TuiAction::Restart => {
+                tracing::info!(
+                    config_path = %startup_config_path.display(),
+                    "user requested tui restart"
+                );
+                *runtime = config::load(Some(startup_config_path))?;
+                *bootstrap_state = bootstrap::prepare(runtime)?;
             }
-        },
+        }
+    }
+}
+
+fn run_cli_command(
+    command: cli::Command,
+    runtime: &config::RuntimeConfig,
+    bootstrap_state: &bootstrap::BootstrapState,
+) -> Result<()> {
+    match command {
+        cli::Command::Tui => unreachable!("TUI command is handled before CLI dispatch"),
         cli::Command::Sync {
             mailbox,
             fixture_dir,
@@ -71,13 +90,13 @@ pub fn run() -> Result<()> {
             reconnect_attempts,
         } => {
             let request = build_sync_request(
-                &runtime,
+                runtime,
                 mailbox,
                 fixture_dir,
                 uidvalidity,
                 reconnect_attempts,
             );
-            run_sync_command(&runtime, &bootstrap_state, request, true)?;
+            run_sync_command(runtime, bootstrap_state, request, true)?;
             Ok(())
         }
         cli::Command::FetchThread {
@@ -86,7 +105,7 @@ pub fn run() -> Result<()> {
         } => {
             let mailbox = mailbox.unwrap_or_else(|| runtime.source_mailbox.clone());
             let summary = sync::fetch_thread(
-                &runtime,
+                runtime,
                 sync::ThreadFetchRequest {
                     mailbox,
                     message_id,
@@ -131,7 +150,7 @@ pub fn run() -> Result<()> {
                     format!("message-id '{}' is not part of a patch series", message_id),
                 )
             })?;
-            let result = patch::run_preflight(&runtime, summary)?;
+            let result = patch::run_preflight(runtime, summary)?;
             println!("{}", patch::format_preflight_report(summary, &result));
             if result.passed {
                 Ok(())
@@ -149,13 +168,13 @@ pub fn run() -> Result<()> {
             let send_email_status = sendmail::check();
             let reply_identity = sendmail::resolve_reply_identity();
 
-            let self_email = config::resolve_self_email(&runtime);
-            let imap_status = probe_doctor_imap(&runtime);
+            let self_email = config::resolve_self_email(runtime);
+            let imap_status = probe_doctor_imap(runtime);
             println!(
                 "{}",
                 format_doctor_report(
-                    &runtime,
-                    &bootstrap_state,
+                    runtime,
+                    bootstrap_state,
                     &self_email,
                     &imap_status,
                     &send_email_status,
@@ -242,6 +261,19 @@ fn format_doctor_report(
     reply_identity: &std::result::Result<ReplyIdentity, String>,
     b4_status: &b4::B4Check,
 ) -> String {
+    let mut lines = doctor_base_lines(runtime, bootstrap_state, self_email);
+    append_doctor_imap_lines(&mut lines, runtime, imap_status);
+    append_doctor_send_email_lines(&mut lines, send_email_status);
+    append_doctor_reply_identity_lines(&mut lines, reply_identity);
+    append_doctor_b4_lines(&mut lines, b4_status);
+    lines.join("\n")
+}
+
+fn doctor_base_lines(
+    runtime: &config::RuntimeConfig,
+    bootstrap_state: &bootstrap::BootstrapState,
+    self_email: &config::SelfEmailResolution,
+) -> Vec<String> {
     let mut lines = vec![
         "criew doctor".to_string(),
         format!("  config_path: {}", runtime.config_path.display()),
@@ -310,6 +342,14 @@ fn format_doctor_report(
             "incomplete"
         }
     ));
+    lines
+}
+
+fn append_doctor_imap_lines(
+    lines: &mut Vec<String>,
+    runtime: &config::RuntimeConfig,
+    imap_status: &DoctorImapStatus,
+) {
     match imap_status {
         DoctorImapStatus::Skipped(missing_fields) => {
             lines.push(format!(
@@ -324,14 +364,8 @@ fn format_doctor_report(
         }
         DoctorImapStatus::Connected(snapshot) => {
             lines.push(format!(
-                "  imap_connection_target: {}:{} ({})",
-                runtime.imap.server.as_deref().unwrap_or("<missing>"),
-                runtime.imap.server_port.unwrap_or_default(),
-                runtime
-                    .imap
-                    .encryption
-                    .map(|value| value.as_str())
-                    .unwrap_or("<missing>")
+                "  imap_connection_target: {}",
+                doctor_imap_connection_target(runtime)
             ));
             lines.push("  imap_connect_status: ok".to_string());
             lines.push(format!("  imap_select_mailbox: {}", IMAP_INBOX_MAILBOX));
@@ -347,18 +381,28 @@ fn format_doctor_report(
         }
         DoctorImapStatus::Error(error) => {
             lines.push(format!(
-                "  imap_connection_target: {}:{} ({})",
-                runtime.imap.server.as_deref().unwrap_or("<missing>"),
-                runtime.imap.server_port.unwrap_or_default(),
-                runtime
-                    .imap
-                    .encryption
-                    .map(|value| value.as_str())
-                    .unwrap_or("<missing>")
+                "  imap_connection_target: {}",
+                doctor_imap_connection_target(runtime)
             ));
             lines.push(format!("  imap_connect_status: error ({error})"));
         }
     }
+}
+
+fn doctor_imap_connection_target(runtime: &config::RuntimeConfig) -> String {
+    format!(
+        "{}:{} ({})",
+        runtime.imap.server.as_deref().unwrap_or("<missing>"),
+        runtime.imap.server_port.unwrap_or_default(),
+        runtime
+            .imap
+            .encryption
+            .map(|value| value.as_str())
+            .unwrap_or("<missing>")
+    )
+}
+
+fn append_doctor_send_email_lines(lines: &mut Vec<String>, send_email_status: &GitSendEmailCheck) {
     match &send_email_status.status {
         GitSendEmailStatus::Available { path, version } => {
             lines.push(format!("  git_send_email_path: {}", path.display()));
@@ -374,6 +418,12 @@ fn format_doctor_report(
             lines.push("  git_send_email_status: missing".to_string());
         }
     }
+}
+
+fn append_doctor_reply_identity_lines(
+    lines: &mut Vec<String>,
+    reply_identity: &std::result::Result<ReplyIdentity, String>,
+) {
     match reply_identity {
         Ok(identity) => {
             lines.push(format!("  reply_from: {}", identity.display));
@@ -388,6 +438,9 @@ fn format_doctor_report(
             lines.push(format!("  reply_identity_status: error ({error})"));
         }
     }
+}
+
+fn append_doctor_b4_lines(lines: &mut Vec<String>, b4_status: &b4::B4Check) {
     match &b4_status.status {
         B4Status::Available { path, version } => {
             lines.push(format!("  b4_path: {}", path.display()));
@@ -403,7 +456,6 @@ fn format_doctor_report(
             lines.push("  b4_status: missing".to_string());
         }
     }
-    lines.join("\n")
 }
 
 fn format_sync_summary(summary: &sync::SyncSummary) -> String {

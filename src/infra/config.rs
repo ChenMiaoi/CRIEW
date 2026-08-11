@@ -677,45 +677,34 @@ fn is_reserved_main_page_keymap_character(character: char) -> bool {
     )
 }
 
+const REQUIRED_UI_KEYMAP_ACTIONS: &[&str] = &["focus_prev", "focus_next", "move_up", "move_down"];
+const OPTIONAL_UI_KEYMAP_ACTIONS: &[&str] = &["jump_top", "jump_bottom", "quick_quit"];
+
 fn validate_ui_custom_keymap_config(
     base: UiKeymapBase,
     custom: &UiCustomKeymapConfig,
 ) -> Result<()> {
-    let mut bindings = vec![
-        (
-            "focus_prev",
-            resolved_ui_keymap_binding(base, custom.focus_prev.as_ref(), "focus_prev")
-                .expect("focus_prev should always resolve"),
-        ),
-        (
-            "focus_next",
-            resolved_ui_keymap_binding(base, custom.focus_next.as_ref(), "focus_next")
-                .expect("focus_next should always resolve"),
-        ),
-        (
-            "move_up",
-            resolved_ui_keymap_binding(base, custom.move_up.as_ref(), "move_up")
-                .expect("move_up should always resolve"),
-        ),
-        (
-            "move_down",
-            resolved_ui_keymap_binding(base, custom.move_down.as_ref(), "move_down")
-                .expect("move_down should always resolve"),
-        ),
-    ];
+    let mut bindings = REQUIRED_UI_KEYMAP_ACTIONS
+        .iter()
+        .map(|action| {
+            let binding =
+                resolved_ui_keymap_binding(base, custom_ui_keymap_binding(custom, action), action)
+                    .ok_or_else(|| {
+                        CriewError::new(
+                            ErrorCode::ConfigParse,
+                            format!("ui.custom_keymap.{action} has no resolvable key binding"),
+                        )
+                    })?;
+            Ok((*action, binding))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    if let Some(binding) = resolved_ui_keymap_binding(base, custom.jump_top.as_ref(), "jump_top") {
-        bindings.push(("jump_top", binding));
-    }
-    if let Some(binding) =
-        resolved_ui_keymap_binding(base, custom.jump_bottom.as_ref(), "jump_bottom")
-    {
-        bindings.push(("jump_bottom", binding));
-    }
-    if let Some(binding) =
-        resolved_ui_keymap_binding(base, custom.quick_quit.as_ref(), "quick_quit")
-    {
-        bindings.push(("quick_quit", binding));
+    for action in OPTIONAL_UI_KEYMAP_ACTIONS {
+        if let Some(binding) =
+            resolved_ui_keymap_binding(base, custom_ui_keymap_binding(custom, action), action)
+        {
+            bindings.push((*action, binding));
+        }
     }
 
     for (index, (left_name, left_binding)) in bindings.iter().enumerate() {
@@ -738,6 +727,22 @@ fn validate_ui_custom_keymap_config(
     }
 
     Ok(())
+}
+
+fn custom_ui_keymap_binding<'a>(
+    custom: &'a UiCustomKeymapConfig,
+    action: &str,
+) -> Option<&'a Vec<String>> {
+    match action {
+        "focus_prev" => custom.focus_prev.as_ref(),
+        "focus_next" => custom.focus_next.as_ref(),
+        "move_up" => custom.move_up.as_ref(),
+        "move_down" => custom.move_down.as_ref(),
+        "jump_top" => custom.jump_top.as_ref(),
+        "jump_bottom" => custom.jump_bottom.as_ref(),
+        "quick_quit" => custom.quick_quit.as_ref(),
+        _ => unreachable!("unexpected custom keymap action"),
+    }
 }
 
 fn resolved_ui_keymap_binding<'a>(

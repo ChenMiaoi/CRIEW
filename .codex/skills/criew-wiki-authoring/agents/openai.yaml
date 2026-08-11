@@ -1,4 +1,0 @@
-interface:
-  display_name: "CRIEW Wiki"
-  short_description: "CRIEW wiki authoring and sync guide"
-  default_prompt: "Use $criew-wiki-authoring to draft, revise, or sync pages under docs/wiki after CRIEW behavior or workflow changes."

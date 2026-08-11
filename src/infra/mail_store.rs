@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::domain::following::FollowingKind;
 use crate::infra::error::{CriewError, ErrorCode, Result};
@@ -17,6 +17,7 @@ use crate::infra::mail_parser::{
     ParsedMailHeaders, ParsedTrailer, normalize_email_address, normalize_subject,
     parse_address_list,
 };
+use crate::infra::sqlite::open as open_connection;
 
 #[derive(Debug, Clone)]
 pub struct MailboxState {
@@ -584,18 +585,28 @@ pub fn refresh_following_updates(path: &Path, self_email: &str) -> Result<usize>
         FollowingKind::CcMe,
         FollowingKind::SentPatch,
     ] {
-        let predicate = match kind {
-            FollowingKind::ToMe => "r.kind = 'to'",
-            FollowingKind::CcMe => "r.kind = 'cc'",
-            FollowingKind::SentPatch => {
-                "r.kind = 'from'
-                    AND lower(trim(m.subject)) NOT LIKE 're:%'
-                    AND lower(trim(m.subject)) NOT LIKE 'fwd:%'
-                    AND instr(lower(m.subject), '[patch') > 0"
-            }
-        };
-        let sql = format!(
-            "
+        inserted += refresh_following_kind(&tx, &self_email, kind)?;
+    }
+
+    tx.commit().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to commit Following updates",
+            error,
+        )
+    })?;
+
+    Ok(inserted)
+}
+
+fn refresh_following_kind(
+    tx: &Transaction<'_>,
+    self_email: &str,
+    kind: FollowingKind,
+) -> Result<usize> {
+    let predicate = following_update_predicate(kind);
+    let insert_sql = format!(
+        "
 INSERT OR IGNORE INTO following_update(mail_id, kind, occurred_at)
 SELECT DISTINCT r.mail_id, ?1, COALESCE(m.date, m.created_at)
 FROM mail_recipient r
@@ -604,9 +615,9 @@ WHERE r.address = ?2
   AND {predicate}
   AND m.is_expunged = 0
 "
-        );
-        let stale_sql = format!(
-            "
+    );
+    let stale_sql = format!(
+        "
 DELETE FROM following_update AS fu
 WHERE fu.kind = ?1
   AND NOT EXISTS (
@@ -619,35 +630,38 @@ WHERE fu.kind = ?1
         AND m.is_expunged = 0
   )
 "
-        );
-        tx.execute(&stale_sql, params![kind.as_str(), self_email])
-            .map_err(|error| {
-                CriewError::with_source(
-                    ErrorCode::Database,
-                    format!("failed to remove stale {} Following updates", kind.as_str()),
-                    error,
-                )
-            })?;
-        inserted += tx
-            .execute(&sql, params![kind.as_str(), self_email])
-            .map_err(|error| {
-                CriewError::with_source(
-                    ErrorCode::Database,
-                    format!("failed to create {} Following updates", kind.as_str()),
-                    error,
-                )
-            })?;
+    );
+
+    tx.execute(&stale_sql, params![kind.as_str(), self_email])
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to remove stale {} Following updates", kind.as_str()),
+                error,
+            )
+        })?;
+
+    tx.execute(&insert_sql, params![kind.as_str(), self_email])
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to create {} Following updates", kind.as_str()),
+                error,
+            )
+        })
+}
+
+fn following_update_predicate(kind: FollowingKind) -> &'static str {
+    match kind {
+        FollowingKind::ToMe => "r.kind = 'to'",
+        FollowingKind::CcMe => "r.kind = 'cc'",
+        FollowingKind::SentPatch => {
+            "r.kind = 'from'
+                AND lower(trim(m.subject)) NOT LIKE 're:%'
+                AND lower(trim(m.subject)) NOT LIKE 'fwd:%'
+                AND instr(lower(m.subject), '[patch') > 0"
+        }
     }
-
-    tx.commit().map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Database,
-            "failed to commit Following updates",
-            error,
-        )
-    })?;
-
-    Ok(inserted)
 }
 
 pub fn record_following_sent_patch(path: &Path, patch: &FollowingSentPatch) -> Result<()> {
@@ -825,28 +839,6 @@ fn collect_thread_rows(
     }
 
     Ok(collected)
-}
-
-fn open_connection(path: &Path) -> Result<Connection> {
-    let connection = Connection::open(path).map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Database,
-            format!("failed to open sqlite database {}", path.display()),
-            error,
-        )
-    })?;
-
-    connection
-        .execute_batch("PRAGMA foreign_keys = ON;")
-        .map_err(|error| {
-            CriewError::with_source(
-                ErrorCode::Database,
-                "failed to enable sqlite foreign key support",
-                error,
-            )
-        })?;
-
-    Ok(connection)
 }
 
 fn load_mailbox_state_tx(tx: &Transaction<'_>, mailbox: &str) -> Result<Option<MailboxState>> {
@@ -1347,9 +1339,38 @@ fn parse_mail_date_header(date_header: Option<&str>) -> Option<String> {
 }
 
 fn build_thread_index_tx(tx: &Transaction<'_>) -> Result<ThreadBuild> {
-    let mut build = ThreadBuild::default();
+    let mut nodes = load_mail_graph_nodes_tx(tx)?;
+    if nodes.is_empty() {
+        return Ok(ThreadBuild {
+            nodes,
+            assignments: HashMap::new(),
+            groups: HashMap::new(),
+        });
+    }
 
-    let mut mail_statement = tx
+    let refs_map = load_mail_references_tx(tx)?;
+    for (mail_id, refs) in refs_map {
+        if let Some(node) = nodes.get_mut(&mail_id) {
+            node.refs = refs;
+        }
+    }
+
+    let message_to_id: HashMap<String, i64> = nodes
+        .values()
+        .map(|node| (node.message_id.clone(), node.id))
+        .collect();
+    let parent_map = build_parent_map(&nodes, &message_to_id);
+    let (assignments, groups) = build_thread_assignments(&nodes, &parent_map);
+
+    Ok(ThreadBuild {
+        nodes,
+        assignments,
+        groups,
+    })
+}
+
+fn load_mail_graph_nodes_tx(tx: &Transaction<'_>) -> Result<HashMap<i64, MailGraphNode>> {
+    let mut statement = tx
         .prepare(
             "
 SELECT id, message_id, subject, in_reply_to, date, created_at
@@ -1365,7 +1386,7 @@ WHERE is_expunged = 0
             )
         })?;
 
-    let mail_rows = mail_statement
+    let rows = statement
         .query_map([], |row| {
             let date = row.get::<_, Option<String>>(4)?;
             let created_at = row.get::<_, String>(5)?;
@@ -1386,7 +1407,8 @@ WHERE is_expunged = 0
             )
         })?;
 
-    for row in mail_rows {
+    let mut nodes = HashMap::new();
+    for row in rows {
         let node = row.map_err(|error| {
             CriewError::with_source(
                 ErrorCode::Database,
@@ -1394,17 +1416,16 @@ WHERE is_expunged = 0
                 error,
             )
         })?;
-        build.nodes.insert(node.id, node);
+        nodes.insert(node.id, node);
     }
 
-    if build.nodes.is_empty() {
-        return Ok(build);
-    }
+    Ok(nodes)
+}
 
-    let mut refs_map: HashMap<i64, Vec<String>> = HashMap::new();
+fn load_mail_references_tx(tx: &Transaction<'_>) -> Result<HashMap<i64, Vec<String>>> {
     // Load references separately so the first pass can build the mail node set
     // without repeating row data for every reference edge.
-    let mut ref_statement = tx
+    let mut statement = tx
         .prepare("SELECT mail_id, ref_message_id FROM mail_ref ORDER BY mail_id, ord ASC")
         .map_err(|error| {
             CriewError::with_source(
@@ -1414,7 +1435,7 @@ WHERE is_expunged = 0
             )
         })?;
 
-    let ref_rows = ref_statement
+    let rows = statement
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
@@ -1422,27 +1443,23 @@ WHERE is_expunged = 0
             CriewError::with_source(ErrorCode::Database, "failed to query mail_ref rows", error)
         })?;
 
-    for row in ref_rows {
+    let mut refs_map: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in rows {
         let (mail_id, ref_id) = row.map_err(|error| {
             CriewError::with_source(ErrorCode::Database, "failed to decode mail_ref row", error)
         })?;
         refs_map.entry(mail_id).or_default().push(ref_id);
     }
 
-    for (mail_id, refs) in refs_map {
-        if let Some(node) = build.nodes.get_mut(&mail_id) {
-            node.refs = refs;
-        }
-    }
+    Ok(refs_map)
+}
 
-    let message_to_id: HashMap<String, i64> = build
-        .nodes
-        .values()
-        .map(|node| (node.message_id.clone(), node.id))
-        .collect();
-
-    let mut parent_map: HashMap<i64, Option<i64>> = HashMap::new();
-    for node in build.nodes.values() {
+fn build_parent_map(
+    nodes: &HashMap<i64, MailGraphNode>,
+    message_to_id: &HashMap<String, i64>,
+) -> HashMap<i64, Option<i64>> {
+    let mut parent_map = HashMap::new();
+    for node in nodes.values() {
         // Prefer the most recent resolvable `References` entry because it keeps
         // threading stable for mails that include the full ancestry chain.
         let parent = node
@@ -1467,11 +1484,20 @@ WHERE is_expunged = 0
         parent_map.insert(node.id, parent);
     }
 
+    parent_map
+}
+
+fn build_thread_assignments(
+    nodes: &HashMap<i64, MailGraphNode>,
+    parent_map: &HashMap<i64, Option<i64>>,
+) -> (HashMap<i64, ThreadAssignment>, HashMap<i64, Vec<i64>>) {
+    let mut assignments: HashMap<i64, ThreadAssignment> = HashMap::new();
+    let mut groups: HashMap<i64, Vec<i64>> = HashMap::new();
     let mut memo = HashMap::new();
-    for mail_id in build.nodes.keys().copied() {
+    for mail_id in nodes.keys().copied() {
         let mut stack = HashSet::new();
         let (root_mail_id, depth) =
-            resolve_thread_assignment(mail_id, &parent_map, &mut memo, &mut stack);
+            resolve_thread_assignment(mail_id, parent_map, &mut memo, &mut stack);
         let parent_mail_id = parent_map
             .get(&mail_id)
             .copied()
@@ -1481,7 +1507,7 @@ WHERE is_expunged = 0
                     .is_some_and(|assignment| assignment.0 == root_mail_id)
             });
 
-        build.assignments.insert(
+        assignments.insert(
             mail_id,
             ThreadAssignment {
                 root_mail_id,
@@ -1489,36 +1515,26 @@ WHERE is_expunged = 0
                 depth,
             },
         );
-        build.groups.entry(root_mail_id).or_default().push(mail_id);
+        groups.entry(root_mail_id).or_default().push(mail_id);
     }
 
-    for mail_ids in build.groups.values_mut() {
+    for mail_ids in groups.values_mut() {
         // Keep a stable order inside each thread so incremental rebuilds do not
         // reshuffle visible rows when the ancestry itself has not changed.
         mail_ids.sort_by(|left, right| {
-            let left_assignment =
-                build
-                    .assignments
-                    .get(left)
-                    .copied()
-                    .unwrap_or(ThreadAssignment {
-                        root_mail_id: *left,
-                        parent_mail_id: None,
-                        depth: 0,
-                    });
-            let right_assignment =
-                build
-                    .assignments
-                    .get(right)
-                    .copied()
-                    .unwrap_or(ThreadAssignment {
-                        root_mail_id: *right,
-                        parent_mail_id: None,
-                        depth: 0,
-                    });
+            let left_assignment = assignments.get(left).copied().unwrap_or(ThreadAssignment {
+                root_mail_id: *left,
+                parent_mail_id: None,
+                depth: 0,
+            });
+            let right_assignment = assignments.get(right).copied().unwrap_or(ThreadAssignment {
+                root_mail_id: *right,
+                parent_mail_id: None,
+                depth: 0,
+            });
 
-            let left_node = build.nodes.get(left);
-            let right_node = build.nodes.get(right);
+            let left_node = nodes.get(left);
+            let right_node = nodes.get(right);
             left_assignment
                 .depth
                 .cmp(&right_assignment.depth)
@@ -1531,7 +1547,7 @@ WHERE is_expunged = 0
         });
     }
 
-    Ok(build)
+    (assignments, groups)
 }
 
 fn resolve_thread_assignment(

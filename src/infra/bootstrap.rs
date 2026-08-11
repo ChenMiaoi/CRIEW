@@ -41,70 +41,29 @@ pub fn prepare(config: &RuntimeConfig) -> Result<BootstrapState> {
 
 fn ensure_runtime_dirs(config: &RuntimeConfig) -> Result<()> {
     if let Some(config_dir) = config.config_path.parent() {
-        fs::create_dir_all(config_dir).map_err(|error| {
-            CriewError::with_source(
-                ErrorCode::Io,
-                format!("failed to create config directory {}", config_dir.display()),
-                error,
-            )
-        })?;
+        ensure_directory(config_dir, "config directory")?;
     }
 
-    fs::create_dir_all(&config.data_dir).map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Io,
-            format!(
-                "failed to create data directory {}",
-                config.data_dir.display()
-            ),
-            error,
-        )
-    })?;
-
-    fs::create_dir_all(&config.raw_mail_dir).map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Io,
-            format!(
-                "failed to create raw mail directory {}",
-                config.raw_mail_dir.display()
-            ),
-            error,
-        )
-    })?;
-
-    fs::create_dir_all(&config.patch_dir).map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Io,
-            format!(
-                "failed to create patch directory {}",
-                config.patch_dir.display()
-            ),
-            error,
-        )
-    })?;
-
-    fs::create_dir_all(&config.log_dir).map_err(|error| {
-        CriewError::with_source(
-            ErrorCode::Io,
-            format!(
-                "failed to create log directory {}",
-                config.log_dir.display()
-            ),
-            error,
-        )
-    })?;
+    ensure_directory(&config.data_dir, "data directory")?;
+    ensure_directory(&config.raw_mail_dir, "raw mail directory")?;
+    ensure_directory(&config.patch_dir, "patch directory")?;
+    ensure_directory(&config.log_dir, "log directory")?;
 
     if let Some(db_dir) = config.database_path.parent() {
-        fs::create_dir_all(db_dir).map_err(|error| {
-            CriewError::with_source(
-                ErrorCode::Io,
-                format!("failed to create database directory {}", db_dir.display()),
-                error,
-            )
-        })?;
+        ensure_directory(db_dir, "database directory")?;
     }
 
     Ok(())
+}
+
+fn ensure_directory(path: &std::path::Path, description: &str) -> Result<()> {
+    fs::create_dir_all(path).map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Io,
+            format!("failed to create {description} {}", path.display()),
+            error,
+        )
+    })
 }
 
 #[cfg(test)]

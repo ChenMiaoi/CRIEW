@@ -1,4 +1,0 @@
-interface:
-  display_name: "CRIEW Development"
-  short_description: "CRIEW repo workflow, coding rules, and doc sync checks"
-  default_prompt: "Use $criew-development to make a focused CRIEW code or config change and assess required README/wiki updates."
