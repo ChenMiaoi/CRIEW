@@ -27,6 +27,8 @@ Chinese quick start: [README-zh.md](README-zh.md)
 cargo install criew
 criew doctor
 criew sync --mailbox io-uring
+# Sync the virtual personal activity view through IMAP header searches.
+criew sync --mailbox Following
 # Fetch every message connected to one Message-ID and rebuild the local thread.
 criew fetch-thread --mailbox io-uring '<reply@example.com>'
 # List patch series that still need a Reviewed-by trailer.
@@ -37,6 +39,14 @@ criew preflight --mailbox io-uring '<patch@example.com>'
 criew outbox
 criew tui
 ```
+
+When IMAP is configured, the TUI exposes a virtual `Following` view instead of
+requiring a separate personal inbox subscription. It is discovered with the
+configured self email address: messages sent to you (`To`), copied to you
+(`Cc`), and patch messages you send are indexed as thread updates
+and shown with `TO`, `CC`, or `SENT` badges. CRIEW searches the IMAP `INBOX`
+by header and keeps that mailbox as an internal sync source; `INBOX` is not a
+second visible subscription.
 
 When an incremental sync only captured part of a conversation, run
 `fetch-thread` with any Message-ID from that conversation. The command follows

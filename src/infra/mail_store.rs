@@ -11,11 +11,16 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use crate::domain::following::FollowingKind;
 use crate::infra::error::{CriewError, ErrorCode, Result};
-use crate::infra::mail_parser::{ParsedMailHeaders, ParsedTrailer, normalize_subject};
+use crate::infra::mail_parser::{
+    ParsedMailHeaders, ParsedTrailer, normalize_email_address, normalize_subject,
+    parse_address_list,
+};
 
 #[derive(Debug, Clone)]
 pub struct MailboxState {
+    #[allow(dead_code)]
     pub mailbox: String,
     pub uidvalidity: u64,
     pub last_seen_uid: u32,
@@ -57,12 +62,25 @@ pub struct ThreadRow {
     pub thread_id: i64,
     pub mail_id: i64,
     pub depth: u16,
+    pub mailbox: String,
     pub subject: String,
     pub from_addr: String,
     pub message_id: String,
     pub in_reply_to: Option<String>,
     pub date: Option<String>,
     pub raw_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FollowingSentPatch {
+    pub mail_id: i64,
+    pub thread_id: i64,
+    pub message_id: String,
+    pub from_addr: String,
+    pub to_addrs: Vec<String>,
+    pub cc_addrs: Vec<String>,
+    pub subject: String,
+    pub occurred_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +397,7 @@ SELECT
     t.id,
     m.id,
     tn.depth,
+    COALESCE(m.imap_mailbox, ''),
     m.subject,
     m.from_addr,
     m.message_id,
@@ -418,6 +437,306 @@ LIMIT ?2
         })?;
 
     collect_thread_rows(rows)
+}
+
+pub fn load_following_thread_rows(
+    path: &Path,
+    self_email: &str,
+    limit: usize,
+) -> Result<Vec<ThreadRow>> {
+    refresh_following_updates(path, self_email)?;
+    let connection = open_connection(path)?;
+    let mut statement = connection
+        .prepare(
+            "
+WITH followed_threads AS (
+    SELECT DISTINCT COALESCE(tn.thread_id, fu.thread_id) AS thread_id
+    FROM following_update fu
+    LEFT JOIN thread_node tn ON tn.mail_id = fu.mail_id
+    WHERE COALESCE(tn.thread_id, fu.thread_id) IS NOT NULL
+)
+SELECT
+    t.id,
+    m.id,
+    tn.depth,
+    COALESCE(m.imap_mailbox, ''),
+    m.subject,
+    m.from_addr,
+    m.message_id,
+    m.in_reply_to,
+    m.date,
+    m.raw_path
+FROM thread_node tn
+JOIN thread t ON t.id = tn.thread_id
+JOIN mail m ON m.id = tn.mail_id
+WHERE m.is_expunged = 0
+  AND t.id IN (SELECT thread_id FROM followed_threads)
+ORDER BY
+    t.last_activity_at DESC,
+    tn.root_mail_id ASC,
+    t.id ASC,
+    tn.depth ASC,
+    tn.sort_ts ASC,
+    tn.mail_id ASC
+LIMIT ?1
+",
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to prepare Following thread query",
+                error,
+            )
+        })?;
+
+    let rows = statement
+        .query_map(params![limit as i64], map_thread_row)
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to query Following threads",
+                error,
+            )
+        })?;
+
+    collect_thread_rows(rows)
+}
+
+pub fn load_following_kinds_by_thread(
+    path: &Path,
+    self_email: &str,
+) -> Result<HashMap<i64, Vec<FollowingKind>>> {
+    refresh_following_updates(path, self_email)?;
+    let connection = open_connection(path)?;
+    let mut statement = connection
+        .prepare(
+            "
+SELECT DISTINCT COALESCE(tn.thread_id, fu.thread_id), fu.kind
+FROM following_update fu
+LEFT JOIN thread_node tn ON tn.mail_id = fu.mail_id
+WHERE COALESCE(tn.thread_id, fu.thread_id) IS NOT NULL
+ORDER BY COALESCE(tn.thread_id, fu.thread_id), fu.kind
+",
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to prepare Following update query",
+                error,
+            )
+        })?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to query Following updates",
+                error,
+            )
+        })?;
+
+    let mut kinds_by_thread = HashMap::new();
+    for row in rows {
+        let (thread_id, kind) = row.map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to decode Following update",
+                error,
+            )
+        })?;
+        let Some(kind) = FollowingKind::from_str(&kind) else {
+            continue;
+        };
+        let values = kinds_by_thread.entry(thread_id).or_insert_with(Vec::new);
+        if !values.contains(&kind) {
+            values.push(kind);
+        }
+    }
+
+    for values in kinds_by_thread.values_mut() {
+        values.sort_unstable();
+    }
+
+    Ok(kinds_by_thread)
+}
+
+pub fn refresh_following_updates(path: &Path, self_email: &str) -> Result<usize> {
+    let Some(self_email) = normalize_email_address(self_email) else {
+        return Ok(0);
+    };
+
+    backfill_mail_recipients(path)?;
+    let mut connection = open_connection(path)?;
+    let tx = connection.transaction().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to begin Following update transaction",
+            error,
+        )
+    })?;
+
+    let mut inserted = 0usize;
+    for kind in [
+        FollowingKind::ToMe,
+        FollowingKind::CcMe,
+        FollowingKind::SentPatch,
+    ] {
+        let predicate = match kind {
+            FollowingKind::ToMe => "r.kind = 'to'",
+            FollowingKind::CcMe => "r.kind = 'cc'",
+            FollowingKind::SentPatch => {
+                "r.kind = 'from'
+                    AND lower(trim(m.subject)) NOT LIKE 're:%'
+                    AND lower(trim(m.subject)) NOT LIKE 'fwd:%'
+                    AND instr(lower(m.subject), '[patch') > 0"
+            }
+        };
+        let sql = format!(
+            "
+INSERT OR IGNORE INTO following_update(mail_id, kind, occurred_at)
+SELECT DISTINCT r.mail_id, ?1, COALESCE(m.date, m.created_at)
+FROM mail_recipient r
+JOIN mail m ON m.id = r.mail_id
+WHERE r.address = ?2
+  AND {predicate}
+  AND m.is_expunged = 0
+"
+        );
+        let stale_sql = format!(
+            "
+DELETE FROM following_update AS fu
+WHERE fu.kind = ?1
+  AND NOT EXISTS (
+      SELECT 1
+      FROM mail_recipient r
+      JOIN mail m ON m.id = r.mail_id
+      WHERE r.mail_id = fu.mail_id
+        AND r.address = ?2
+        AND {predicate}
+        AND m.is_expunged = 0
+  )
+"
+        );
+        tx.execute(&stale_sql, params![kind.as_str(), self_email])
+            .map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to remove stale {} Following updates", kind.as_str()),
+                    error,
+                )
+            })?;
+        inserted += tx
+            .execute(&sql, params![kind.as_str(), self_email])
+            .map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to create {} Following updates", kind.as_str()),
+                    error,
+                )
+            })?;
+    }
+
+    tx.commit().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to commit Following updates",
+            error,
+        )
+    })?;
+
+    Ok(inserted)
+}
+
+pub fn record_following_sent_patch(path: &Path, patch: &FollowingSentPatch) -> Result<()> {
+    let mut connection = open_connection(path)?;
+    let tx = connection.transaction().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to begin sent patch Following transaction",
+            error,
+        )
+    })?;
+
+    tx.execute(
+        "
+UPDATE mail
+SET message_id = ?1,
+    subject = ?2,
+    from_addr = ?3,
+    date = ?4
+WHERE id = ?5 AND imap_mailbox IS NULL
+",
+        params![
+            patch.message_id,
+            patch.subject,
+            patch.from_addr,
+            patch.occurred_at,
+            patch.mail_id
+        ],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            format!("failed to update sent patch mail {}", patch.mail_id),
+            error,
+        )
+    })?;
+
+    replace_mail_recipient_values_tx(
+        &tx,
+        patch.mail_id,
+        &patch.from_addr,
+        &patch.to_addrs,
+        &patch.cc_addrs,
+    )?;
+    tx.execute(
+        "
+INSERT OR IGNORE INTO following_update(mail_id, thread_id, kind, occurred_at)
+VALUES (?1, ?2, ?3, ?4)
+",
+        params![
+            patch.mail_id,
+            patch.thread_id,
+            FollowingKind::SentPatch.as_str(),
+            patch.occurred_at
+        ],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            format!(
+                "failed to record sent patch Following update for mail {}",
+                patch.mail_id
+            ),
+            error,
+        )
+    })?;
+    tx.execute(
+        "UPDATE thread SET subject_norm = ?1, last_activity_at = ?2 WHERE id = ?3",
+        params![
+            normalize_subject(&patch.subject),
+            patch.occurred_at,
+            patch.thread_id
+        ],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            format!("failed to update sent patch thread {}", patch.thread_id),
+            error,
+        )
+    })?;
+
+    tx.commit().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to commit sent patch Following update",
+            error,
+        )
+    })
 }
 
 pub fn load_thread_trailers_by_mailbox(
@@ -485,12 +804,13 @@ fn map_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
         thread_id: row.get::<_, i64>(0)?,
         mail_id: row.get::<_, i64>(1)?,
         depth: row.get::<_, i64>(2)? as u16,
-        subject: row.get::<_, String>(3)?,
-        from_addr: row.get::<_, String>(4)?,
-        message_id: row.get::<_, String>(5)?,
-        in_reply_to: row.get::<_, Option<String>>(6)?,
-        date: row.get::<_, Option<String>>(7)?,
-        raw_path: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+        mailbox: row.get::<_, String>(3)?,
+        subject: row.get::<_, String>(4)?,
+        from_addr: row.get::<_, String>(5)?,
+        message_id: row.get::<_, String>(6)?,
+        in_reply_to: row.get::<_, Option<String>>(7)?,
+        date: row.get::<_, Option<String>>(8)?,
+        raw_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
     })
 }
 
@@ -745,6 +1065,8 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
         })?;
     }
 
+    replace_mail_recipients_tx(tx, mail_id, &mail.parsed)?;
+
     tx.execute(
         "DELETE FROM mail_trailer WHERE mail_id = ?1",
         params![mail_id],
@@ -775,6 +1097,140 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
     }
 
     Ok((mail_id, existing_id.is_none()))
+}
+
+fn replace_mail_recipients_tx(
+    tx: &Transaction<'_>,
+    mail_id: i64,
+    parsed: &ParsedMailHeaders,
+) -> Result<()> {
+    replace_mail_recipient_values_tx(
+        tx,
+        mail_id,
+        &parsed.from_addr,
+        &parsed.to_addresses,
+        &parsed.cc_addresses,
+    )
+}
+
+fn replace_mail_recipient_values_tx(
+    tx: &Transaction<'_>,
+    mail_id: i64,
+    from_addr: &str,
+    to_addresses: &[String],
+    cc_addresses: &[String],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM mail_recipient WHERE mail_id = ?1",
+        params![mail_id],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            format!("failed to clear recipients for mail {mail_id}"),
+            error,
+        )
+    })?;
+
+    let mut recipients = Vec::new();
+    recipients.extend(
+        parse_address_list(from_addr)
+            .into_iter()
+            .map(|address| ("from", address)),
+    );
+    recipients.extend(to_addresses.iter().cloned().map(|address| ("to", address)));
+    recipients.extend(cc_addresses.iter().cloned().map(|address| ("cc", address)));
+
+    let mut ord_by_kind: HashMap<&str, i64> = HashMap::new();
+    for (kind, address) in recipients {
+        let ord = ord_by_kind.entry(kind).or_insert(0);
+        tx.execute(
+            "INSERT INTO mail_recipient(mail_id, kind, address, ord) VALUES (?1, ?2, ?3, ?4)",
+            params![mail_id, kind, address, *ord],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to persist {kind} recipient for mail {mail_id}"),
+                error,
+            )
+        })?;
+        *ord += 1;
+    }
+
+    Ok(())
+}
+
+fn backfill_mail_recipients(path: &Path) -> Result<()> {
+    let mut connection = open_connection(path)?;
+    let tx = connection.transaction().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to begin recipient backfill transaction",
+            error,
+        )
+    })?;
+
+    let candidates = {
+        let mut statement = tx
+            .prepare(
+                "
+SELECT m.id, m.message_id, m.raw_path
+FROM mail m
+LEFT JOIN mail_recipient r ON r.mail_id = m.id
+WHERE r.mail_id IS NULL AND m.raw_path IS NOT NULL
+",
+            )
+            .map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    "failed to prepare recipient backfill query",
+                    error,
+                )
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    "failed to query recipient backfill candidates",
+                    error,
+                )
+            })?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(row.map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    "failed to decode recipient backfill candidate",
+                    error,
+                )
+            })?);
+        }
+        candidates
+    };
+
+    for (mail_id, message_id, raw_path) in candidates {
+        let Ok(raw) = fs::read(&raw_path) else {
+            continue;
+        };
+        let parsed = crate::infra::mail_parser::parse_headers(&raw, message_id);
+        replace_mail_recipients_tx(&tx, mail_id, &parsed)?;
+    }
+
+    tx.commit().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to commit recipient backfill",
+            error,
+        )
+    })
 }
 
 fn expand_affected_mail_ids_tx(
@@ -1261,11 +1717,13 @@ mod tests {
 
     use crate::infra::db;
     use crate::infra::mail_parser;
+    use crate::infra::reply_store;
 
     use super::{
-        IncomingMail, SyncBatch, apply_sync_batch, load_mailbox_state, load_thread_rows_by_mailbox,
+        IncomingMail, SyncBatch, apply_sync_batch, load_following_kinds_by_thread,
+        load_following_thread_rows, load_mailbox_state, load_thread_rows_by_mailbox,
         load_thread_trailers_by_mailbox, mailbox_message_count, prune_mailbox_subjects,
-        rebuild_all_threads,
+        rebuild_all_threads, record_following_sent_patch,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1454,6 +1912,130 @@ mod tests {
             load_thread_trailers_by_mailbox(&db_path, "inbox")
                 .expect("reload review trailers")
                 .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn following_view_indexes_to_cc_and_sent_patch_updates() {
+        let root = temp_dir("following-updates");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "INBOX".to_string(),
+                uidvalidity: 1,
+                highest_uid: 5,
+                highest_modseq: Some(5),
+                mails: vec![
+                    incoming(
+                        "INBOX",
+                        1,
+                        "Message-ID: <to@example.com>\nSubject: [PATCH 0/1] to me\nFrom: alice@example.com\nTo: Me <ME@example.com>\n\nbody\n",
+                    ),
+                    incoming(
+                        "INBOX",
+                        2,
+                        "Message-ID: <cc@example.com>\nSubject: Re: [PATCH 0/1] to me\nFrom: bob@example.com\nCc: me@example.com\nIn-Reply-To: <to@example.com>\n\nbody\n",
+                    ),
+                    incoming(
+                        "INBOX",
+                        3,
+                        "Message-ID: <sent@example.com>\nSubject: [PATCH 1/1] sent patch\nFrom: Me <me@example.com>\nTo: list@example.com\n\nbody\n",
+                    ),
+                    incoming(
+                        "INBOX",
+                        4,
+                        "Message-ID: <sent-reply@example.com>\nSubject: Re: [PATCH 1/1] sent patch\nFrom: me@example.com\nTo: list@example.com\n\nbody\n",
+                    ),
+                    incoming(
+                        "INBOX",
+                        5,
+                        "Message-ID: <unrelated@example.com>\nSubject: status\nFrom: carol@example.com\nTo: me@example.com\n\nbody\n",
+                    ),
+                ],
+            },
+        )
+        .expect("seed Following candidates");
+
+        let rows = load_following_thread_rows(&db_path, "me@example.com", 100)
+            .expect("load Following rows");
+        let message_ids: HashSet<String> = rows.iter().map(|row| row.message_id.clone()).collect();
+        assert!(message_ids.contains("to@example.com"));
+        assert!(message_ids.contains("cc@example.com"));
+        assert!(message_ids.contains("sent@example.com"));
+        assert!(message_ids.contains("unrelated@example.com"));
+        assert!(!message_ids.contains("sent-reply@example.com"));
+
+        let kinds_by_thread = load_following_kinds_by_thread(&db_path, "ME@EXAMPLE.COM")
+            .expect("load Following kinds");
+        let kinds_for = |message_id: &str| {
+            let row = rows
+                .iter()
+                .find(|row| row.message_id == message_id)
+                .expect("Following row for message");
+            kinds_by_thread
+                .get(&row.thread_id)
+                .expect("Following badges")
+        };
+        assert!(
+            kinds_for("to@example.com").contains(&crate::domain::following::FollowingKind::ToMe)
+        );
+        assert!(
+            kinds_for("cc@example.com").contains(&crate::domain::following::FollowingKind::CcMe)
+        );
+        assert!(
+            kinds_for("sent@example.com")
+                .contains(&crate::domain::following::FollowingKind::SentPatch)
+        );
+
+        let repeated = load_following_thread_rows(&db_path, "me@example.com", 100)
+            .expect("reload Following rows");
+        assert_eq!(repeated.len(), rows.len());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn following_view_records_local_sent_patch_on_compose_anchor() {
+        let root = temp_dir("following-sent-anchor");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+        let (thread_id, mail_id) = reply_store::create_draft_anchor(
+            &db_path,
+            "compose-draft@criew.local",
+            "",
+            "Me <me@example.com>",
+        )
+        .expect("create compose anchor");
+
+        record_following_sent_patch(
+            &db_path,
+            &super::FollowingSentPatch {
+                mail_id,
+                thread_id,
+                message_id: "sent-local@example.com".to_string(),
+                from_addr: "Me <me@example.com>".to_string(),
+                to_addrs: vec!["list@example.com".to_string()],
+                cc_addrs: Vec::new(),
+                subject: "[PATCH 1/1] local patch".to_string(),
+                occurred_at: "2026-08-10T00:00:00Z".to_string(),
+            },
+        )
+        .expect("record local sent patch");
+
+        let rows = load_following_thread_rows(&db_path, "me@example.com", 20)
+            .expect("load local sent patch");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "sent-local@example.com");
+        let kinds = load_following_kinds_by_thread(&db_path, "me@example.com")
+            .expect("load local sent patch badge");
+        assert_eq!(
+            kinds.get(&thread_id),
+            Some(&vec![crate::domain::following::FollowingKind::SentPatch])
         );
 
         let _ = fs::remove_dir_all(root);

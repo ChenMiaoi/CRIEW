@@ -21,11 +21,12 @@ use crate::app::cli::ReviewInboxMode;
 use crate::app::patch as patch_worker;
 use crate::app::review as review_worker;
 use crate::app::sync as sync_worker;
+use crate::domain::following::FollowingKind;
 use crate::domain::subscriptions::{
     DEFAULT_SUBSCRIPTIONS, SubscriptionCategory, category_for_mailbox,
 };
 use crate::infra::bootstrap::BootstrapState;
-use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
+use crate::infra::config::{FOLLOWING_VIEW, IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::mail_store::{self, ThreadRow};
 use crate::infra::reply_store::{
@@ -256,7 +257,11 @@ const THREAD_LINE_MAX_CHARS: usize = 120;
 const KERNEL_TREE_MAX_ROWS: usize = 2048;
 const CODE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 const CODE_PREVIEW_MAX_LINES: usize = 800;
-const MY_INBOX_LABEL: &str = "My Inbox";
+const FOLLOWING_LABEL: &str = "Following";
+// Kept as a source-level compatibility alias for existing TUI tests and
+// helper code; the visible subscription is now named Following.
+#[cfg(test)]
+const MY_INBOX_LABEL: &str = FOLLOWING_LABEL;
 const CONFIG_GET_KEYS: &[&str] = &[
     "config.path",
     "storage.data_dir",
@@ -327,7 +332,7 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
     },
     ConfigEditorField {
         key: "ui.inbox_auto_sync_interval_secs",
-        description: "Seconds between My Inbox background auto-sync runs while TUI stays open.",
+        description: "Seconds between Following background auto-sync runs while TUI stays open.",
     },
     ConfigEditorField {
         key: "logging.filter",
@@ -1408,6 +1413,8 @@ struct AppState {
     disabled_linux_subsystem_expanded: bool,
     disabled_qemu_subsystem_expanded: bool,
     threads: Vec<ThreadRow>,
+    self_email: Option<String>,
+    following_kinds: HashMap<i64, Vec<FollowingKind>>,
     series_summaries: HashMap<i64, patch_worker::SeriesSummary>,
     review_summaries: HashMap<i64, review_worker::ReviewInboxEntry>,
     review_inbox_mode: Option<ReviewInboxMode>,
@@ -1480,14 +1487,18 @@ impl AppState {
             .as_ref()
             .map(UiState::normalized_saved_views)
             .unwrap_or_default();
-        let enabled_mailboxes: HashSet<String> = enabled_mailboxes.into_iter().collect();
+        let enabled_mailboxes: HashSet<String> = enabled_mailboxes
+            .into_iter()
+            .map(|mailbox| canonical_view_mailbox(&mailbox))
+            .collect();
         let active_thread_mailbox = persisted
             .as_ref()
             .and_then(|state| state.active_mailbox.as_ref())
             .map(|mailbox| mailbox.trim())
             .filter(|mailbox| !mailbox.is_empty())
-            .map(ToOwned::to_owned)
+            .map(canonical_view_mailbox)
             .unwrap_or_else(|| runtime.default_active_mailbox().to_string());
+        let self_email = crate::infra::config::resolve_self_email(&runtime).email;
         let my_inbox_default = if runtime.imap.is_complete() && !persisted_imap_defaults_initialized
         {
             MyInboxDefault::EnableOnFirstOpen
@@ -1539,6 +1550,8 @@ impl AppState {
                 .map(|state| state.disabled_qemu_subsystem_expanded)
                 .unwrap_or(true),
             threads,
+            self_email,
+            following_kinds: HashMap::new(),
             series_summaries: HashMap::new(),
             review_summaries: HashMap::new(),
             review_inbox_mode: None,
@@ -1596,6 +1609,7 @@ impl AppState {
         {
             state.subscription_index = index;
         }
+        state.refresh_following_kinds();
         state.refresh_series_summaries();
         state.refresh_review_summaries();
         state.apply_thread_filter();
@@ -1656,6 +1670,7 @@ impl AppState {
 
     fn replace_threads(&mut self, threads: Vec<ThreadRow>) {
         self.threads = threads;
+        self.refresh_following_kinds();
         self.refresh_series_summaries();
         self.refresh_review_summaries();
         self.thread_index = 0;
@@ -1703,11 +1718,12 @@ impl AppState {
         status: String,
         persist_ui_state: bool,
     ) {
-        self.active_thread_mailbox = mailbox.to_string();
+        let mailbox = canonical_view_mailbox(mailbox);
+        self.active_thread_mailbox = mailbox.clone();
         if let Some(index) = self
             .subscriptions
             .iter()
-            .position(|item| same_mailbox_name(&item.mailbox, mailbox))
+            .position(|item| same_mailbox_name(&item.mailbox, &mailbox))
         {
             self.subscription_index = index;
             self.sync_subscription_row_to_selected_item();
@@ -1745,11 +1761,7 @@ impl AppState {
         }
 
         for mailbox in unique_candidates {
-            match mail_store::load_thread_rows_by_mailbox(
-                &self.runtime.database_path,
-                &mailbox,
-                500,
-            ) {
+            match self.load_thread_rows_for_view(&mailbox, 500) {
                 Ok(rows) if !rows.is_empty() => {
                     self.show_mailbox_threads(
                         &mailbox,
@@ -1794,8 +1806,7 @@ impl AppState {
     }
 
     fn inbox_auto_sync_mailbox_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
-        mailbox
-            .eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
+        is_following_view(mailbox)
             .then(|| {
                 self.inbox_auto_sync
                     .as_ref()
@@ -1880,7 +1891,7 @@ impl AppState {
                         format!(
                             "sync {} auto {}",
                             self.render_indeterminate_progress_bar(),
-                            IMAP_INBOX_MAILBOX
+                            FOLLOWING_VIEW
                         )
                     })
             })
@@ -1954,6 +1965,41 @@ impl AppState {
         }
     }
 
+    fn refresh_following_kinds(&mut self) {
+        if !is_following_view(&self.active_thread_mailbox) {
+            self.following_kinds.clear();
+            return;
+        }
+
+        let Some(self_email) = self.self_email.as_deref() else {
+            self.following_kinds.clear();
+            return;
+        };
+
+        match mail_store::load_following_kinds_by_thread(&self.runtime.database_path, self_email) {
+            Ok(kinds) => self.following_kinds = kinds,
+            Err(error) => {
+                self.following_kinds.clear();
+                tracing::warn!(error = %error, "failed to hydrate Following badges");
+            }
+        }
+    }
+
+    fn load_thread_rows_for_view(&self, mailbox: &str, limit: usize) -> Result<Vec<ThreadRow>> {
+        if is_following_view(mailbox) {
+            let Some(self_email) = self.self_email.as_deref() else {
+                return Ok(Vec::new());
+            };
+            return mail_store::load_following_thread_rows(
+                &self.runtime.database_path,
+                self_email,
+                limit,
+            );
+        }
+
+        mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, mailbox, limit)
+    }
+
     fn refresh_review_summaries(&mut self) {
         match review_worker::build_review_index(
             &self.runtime.database_path,
@@ -1983,7 +2029,7 @@ impl AppState {
     fn enabled_background_sync_mailboxes(&self) -> Vec<String> {
         self.subscriptions
             .iter()
-            .filter(|item| item.enabled && !item.mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+            .filter(|item| item.enabled && !is_following_view(&item.mailbox))
             .map(|item| item.mailbox.clone())
             .collect()
     }
@@ -1993,7 +2039,7 @@ impl AppState {
             && self
                 .subscriptions
                 .iter()
-                .any(|item| item.enabled && item.mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+                .any(|item| item.enabled && is_following_view(&item.mailbox))
     }
 
     fn subscription_auto_sync_enabled(&self) -> bool {
@@ -2047,7 +2093,12 @@ impl AppState {
         requested_mailboxes: Vec<String>,
         origin: ManualSyncOrigin,
     ) -> ManualSyncRequestOutcome {
-        let requested_mailboxes = dedup_mailboxes(requested_mailboxes);
+        let requested_mailboxes = dedup_mailboxes(
+            requested_mailboxes
+                .into_iter()
+                .map(|mailbox| canonical_view_mailbox(&mailbox))
+                .collect(),
+        );
         if requested_mailboxes.is_empty() {
             self.status = "sync skipped: no mailbox selected".to_string();
             tracing::info!(
@@ -2119,13 +2170,13 @@ impl AppState {
 
         if queued_mailboxes
             .iter()
-            .any(|mailbox| mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+            .any(|mailbox| is_following_view(mailbox))
         {
             self.defer_inbox_auto_sync();
         }
         if queued_mailboxes
             .iter()
-            .any(|mailbox| !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+            .any(|mailbox| !is_following_view(mailbox))
         {
             self.defer_subscription_auto_sync();
         }
@@ -2216,7 +2267,13 @@ impl AppState {
     }
 
     fn start_thread_fetch(&mut self, message_id: String) {
-        let mailbox = self.active_thread_mailbox.clone();
+        let mailbox = if is_following_view(&self.active_thread_mailbox) {
+            self.selected_thread()
+                .and_then(|row| (!row.mailbox.trim().is_empty()).then_some(row.mailbox.clone()))
+                .unwrap_or_else(|| self.active_thread_mailbox.clone())
+        } else {
+            self.active_thread_mailbox.clone()
+        };
         self.start_thread_fetch_for_mailbox(mailbox, message_id);
     }
 
@@ -2380,9 +2437,9 @@ impl AppState {
         }
 
         tracing::info!(
-            op = "inbox_auto_sync",
+            op = "following_auto_sync",
             status = "started",
-            mailbox = IMAP_INBOX_MAILBOX
+            mailbox = FOLLOWING_VIEW
         );
         state.receiver = Some((self.mailbox_sync_spawner)(
             self.runtime.clone(),
@@ -2574,7 +2631,7 @@ impl AppState {
                 inserted,
                 updated,
             } => {
-                if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                if is_following_view(&mailbox) {
                     self.defer_inbox_auto_sync();
                 } else {
                     self.defer_subscription_auto_sync();
@@ -2614,7 +2671,7 @@ impl AppState {
                 }
             }
             StartupSyncEvent::MailboxFailed { mailbox, error } => {
-                if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                if is_following_view(&mailbox) {
                     self.defer_inbox_auto_sync();
                 } else {
                     self.defer_subscription_auto_sync();
@@ -2687,7 +2744,7 @@ impl AppState {
                 }
                 if inserted > 0 || updated > 0 {
                     self.status = format!(
-                        "My Inbox auto-sync: fetched={} inserted={} updated={}",
+                        "Following auto-sync: fetched={} inserted={} updated={}",
                         fetched, inserted, updated
                     );
                 }
@@ -2704,7 +2761,7 @@ impl AppState {
                 if let Some(state) = self.inbox_auto_sync.as_mut() {
                     state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
                 }
-                self.status = format!("My Inbox auto-sync failed: {error}");
+                self.status = format!("Following auto-sync failed: {error}");
                 tracing::error!(
                     op = "inbox_auto_sync",
                     status = "failed",
@@ -2922,10 +2979,10 @@ impl AppState {
                 inserted,
                 updated,
             } => {
-                if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                if is_following_view(&mailbox) {
                     self.defer_inbox_auto_sync();
                 }
-                if !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                if !is_following_view(&mailbox) {
                     self.defer_subscription_auto_sync();
                 }
                 if let Some(sync_state) = self.startup_sync.as_mut() {
@@ -2967,10 +3024,10 @@ impl AppState {
                 }
             }
             StartupSyncEvent::MailboxFailed { mailbox, error } => {
-                if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                if is_following_view(&mailbox) {
                     self.defer_inbox_auto_sync();
                 }
-                if !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                if !is_following_view(&mailbox) {
                     self.defer_subscription_auto_sync();
                 }
                 if let Some(sync_state) = self.startup_sync.as_mut() {
@@ -3128,8 +3185,7 @@ impl AppState {
     }
 
     fn reload_mailbox_threads_preserving_selection(&mut self, mailbox: &str) -> Result<()> {
-        let rows =
-            mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, mailbox, 500)?;
+        let rows = self.load_thread_rows_for_view(mailbox, 500)?;
         if same_mailbox_name(mailbox, &self.active_thread_mailbox) {
             self.replace_threads_preserving_selection(rows);
         }
@@ -3223,7 +3279,7 @@ impl AppState {
         items: Vec<(usize, &SubscriptionItem)>,
     ) {
         // Leave uncategorized entries visible above subsystem buckets so
-        // `My Inbox` and user-added mailboxes stay easy to discover.
+        // `Following` and user-added mailboxes stay easy to discover.
         for (index, item) in items
             .iter()
             .copied()
@@ -3464,7 +3520,7 @@ impl AppState {
             return;
         }
 
-        match mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, &mailbox, 500) {
+        match self.load_thread_rows_for_view(&mailbox, 500) {
             Ok(rows) if !rows.is_empty() => {
                 self.show_mailbox_threads(
                     &mailbox,
@@ -4014,7 +4070,8 @@ impl AppState {
                     message_id = %outcome.message_id,
                     "reply sent"
                 );
-                let status = if let Err(error) = persist_result {
+                let persist_error = persist_result.err();
+                let status = if let Some(error) = persist_error.as_ref() {
                     format!(
                         "reply sent as <{}> but failed to persist send result: {}",
                         outcome.message_id, error
@@ -4022,6 +4079,18 @@ impl AppState {
                 } else {
                     format!("reply sent as <{}>", outcome.message_id)
                 };
+                if persist_error.is_none() && is_following_view(&self.active_thread_mailbox) {
+                    let active_mailbox = self.active_thread_mailbox.clone();
+                    if let Err(error) =
+                        self.reload_mailbox_threads_preserving_selection(&active_mailbox)
+                    {
+                        tracing::warn!(
+                            op = "following.local_send",
+                            error = %error,
+                            "sent patch was recorded but Following view could not be refreshed"
+                        );
+                    }
+                }
                 self.discard_reply_panel(status);
             }
             SendStatus::Failed | SendStatus::TimedOut => {
@@ -5698,7 +5767,7 @@ fn persist_reply_send_result(
     request: &SendRequest,
     outcome: &SendOutcome,
 ) -> Result<i64> {
-    reply_store::insert_reply_send(
+    let record_id = reply_store::insert_reply_send(
         &runtime.database_path,
         &ReplySendRecordRequest {
             thread_id: request.thread_id,
@@ -5733,7 +5802,32 @@ fn persist_reply_send_result(
             started_at: outcome.started_at.clone(),
             finished_at: outcome.finished_at.clone(),
         },
-    )
+    )?;
+
+    if matches!(outcome.status, SendStatus::Sent) && is_outgoing_patch_subject(&request.subject) {
+        mail_store::record_following_sent_patch(
+            &runtime.database_path,
+            &mail_store::FollowingSentPatch {
+                mail_id: request.mail_id,
+                thread_id: request.thread_id,
+                message_id: outcome.message_id.clone(),
+                from_addr: request.from.clone(),
+                to_addrs: request.to.clone(),
+                cc_addrs: request.cc.clone(),
+                subject: request.subject.clone(),
+                occurred_at: outcome.finished_at.clone(),
+            },
+        )?;
+    }
+
+    Ok(record_id)
+}
+
+fn is_outgoing_patch_subject(subject: &str) -> bool {
+    let normalized = subject.trim().to_ascii_lowercase();
+    !normalized.starts_with("re:")
+        && !normalized.starts_with("fwd:")
+        && patch_worker::subject_is_patch_related(subject)
 }
 
 fn now_timestamp() -> String {
@@ -5796,10 +5890,9 @@ pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiActi
         .and_then(|state| state.active_mailbox.as_ref())
         .map(|mailbox| mailbox.trim())
         .filter(|mailbox| !mailbox.is_empty())
-        .map(ToOwned::to_owned)
+        .map(canonical_view_mailbox)
         .unwrap_or_else(|| config.default_active_mailbox().to_string());
-    let threads =
-        mail_store::load_thread_rows_by_mailbox(&config.database_path, &initial_mailbox, 500)?;
+    let threads = load_thread_rows_for_runtime(config, &initial_mailbox, 500)?;
     let mut terminal = setup_terminal()?;
     let guard = TerminalGuard;
     let mut state = if let Some(persisted) = persisted_ui_state {
@@ -5837,6 +5930,21 @@ fn load_persisted_ui_state(path: &std::path::Path) -> Option<UiState> {
             None
         }
     }
+}
+
+fn load_thread_rows_for_runtime(
+    config: &RuntimeConfig,
+    mailbox: &str,
+    limit: usize,
+) -> Result<Vec<ThreadRow>> {
+    if is_following_view(mailbox) {
+        let Some(self_email) = crate::infra::config::resolve_self_email(config).email else {
+            return Ok(Vec::new());
+        };
+        return mail_store::load_following_thread_rows(&config.database_path, &self_email, limit);
+    }
+
+    mail_store::load_thread_rows_by_mailbox(&config.database_path, mailbox, limit)
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -6092,16 +6200,16 @@ fn default_subscriptions(
         .collect();
 
     if runtime.imap.is_complete() {
-        // `My Inbox` is special: expose it only when the account is usable, but
-        // default it on so IMAP users do not have to discover it manually.
-        let enable_my_inbox = mailbox_set_contains(enabled_mailboxes, IMAP_INBOX_MAILBOX)
+        // Following is special: it is backed by the private IMAP INBOX but is
+        // discovered through recipient searches instead of exposing raw INBOX.
+        let enable_following = mailbox_set_contains(enabled_mailboxes, FOLLOWING_VIEW)
             || my_inbox_default.should_enable_when_missing();
         items.insert(
             0,
             SubscriptionItem {
                 mailbox: IMAP_INBOX_MAILBOX.to_string(),
-                label: MY_INBOX_LABEL.to_string(),
-                enabled: enable_my_inbox,
+                label: FOLLOWING_LABEL.to_string(),
+                enabled: enable_following,
                 category: None,
             },
         );
@@ -6127,8 +6235,8 @@ fn default_subscriptions(
         }
         items.push(SubscriptionItem {
             mailbox: mailbox.clone(),
-            label: if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
-                MY_INBOX_LABEL.to_string()
+            label: if is_following_view(mailbox) {
+                FOLLOWING_LABEL.to_string()
             } else {
                 mailbox.clone()
             },
@@ -6146,8 +6254,8 @@ fn default_subscriptions(
         // invisible selection.
         items.push(SubscriptionItem {
             mailbox: mailbox.to_string(),
-            label: if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
-                MY_INBOX_LABEL.to_string()
+            label: if is_following_view(mailbox) {
+                FOLLOWING_LABEL.to_string()
             } else {
                 mailbox.to_string()
             },
@@ -6178,7 +6286,30 @@ impl MyInboxDefault {
 }
 
 fn same_mailbox_name(left: &str, right: &str) -> bool {
+    if is_following_view(left) && is_following_view(right) {
+        return true;
+    }
     left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn is_following_view(mailbox: &str) -> bool {
+    mailbox.eq_ignore_ascii_case(FOLLOWING_VIEW) || mailbox.trim() == IMAP_INBOX_MAILBOX
+}
+
+fn canonical_view_mailbox(mailbox: &str) -> String {
+    if is_following_view(mailbox) {
+        IMAP_INBOX_MAILBOX.to_string()
+    } else {
+        mailbox.trim().to_string()
+    }
+}
+
+fn display_mailbox_name(mailbox: &str) -> &str {
+    if is_following_view(mailbox) {
+        FOLLOWING_VIEW
+    } else {
+        mailbox
+    }
 }
 
 fn mailbox_set_contains(mailboxes: &HashSet<String>, candidate: &str) -> bool {

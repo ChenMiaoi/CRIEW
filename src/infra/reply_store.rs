@@ -322,6 +322,21 @@ VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1)
             )
         })?;
     let thread_id = transaction.last_insert_rowid();
+    transaction
+        .execute(
+            "
+INSERT INTO thread_node(mail_id, thread_id, parent_mail_id, root_mail_id, depth, sort_ts)
+VALUES (?1, ?2, NULL, ?1, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+",
+            params![mail_id, thread_id],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to create compose thread node for mail {mail_id}"),
+                error,
+            )
+        })?;
     transaction.commit().map_err(|error| {
         CriewError::with_source(
             ErrorCode::Database,

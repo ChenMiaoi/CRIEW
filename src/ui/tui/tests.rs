@@ -59,6 +59,7 @@ fn sample_thread(subject: &str, message_id: &str, depth: u16) -> ThreadRow {
         thread_id: 1,
         mail_id: 1,
         depth,
+        mailbox: "io-uring".to_string(),
         subject: subject.to_string(),
         from_addr: "alice@example.com".to_string(),
         message_id: message_id.to_string(),
@@ -78,6 +79,7 @@ fn sample_thread_with_raw(
         thread_id: 1,
         mail_id: 1,
         depth,
+        mailbox: "io-uring".to_string(),
         subject: subject.to_string(),
         from_addr: "alice@example.com".to_string(),
         message_id: message_id.to_string(),
@@ -108,6 +110,7 @@ fn sample_thread_in_thread(
         thread_id,
         mail_id,
         depth,
+        mailbox: "io-uring".to_string(),
         subject: subject.to_string(),
         from_addr: "alice@example.com".to_string(),
         message_id: message_id.to_string(),
@@ -224,7 +227,7 @@ fn seed_mailbox_thread(db_path: &Path, mailbox: &str, uid: u32, message_id: &str
                 raw_path: PathBuf::from(format!("/tmp/{mailbox}-{uid}.eml")),
                 parsed: mail_parser::parse_headers(
                     format!(
-                        "Message-ID: <{message_id}>\nSubject: {subject}\nFrom: Alice <alice@example.com>\n\nbody\n"
+                        "Message-ID: <{message_id}>\nSubject: {subject}\nFrom: Alice <alice@example.com>\nTo: me@example.com\n\nbody\n"
                     )
                     .as_bytes(),
                     format!("synthetic-{mailbox}-{uid}@local"),
@@ -4988,7 +4991,7 @@ fn background_sync_progress_text_reports_auto_sync_sources() {
     let inbox_progress = inbox_state
         .background_sync_progress_text()
         .expect("inbox progress");
-    assert!(inbox_progress.contains("auto INBOX"));
+    assert!(inbox_progress.contains("auto Following"));
     assert_eq!(inbox_progress.matches('>').count(), 3);
 
     let mut subscription_state = AppState::new(vec![], test_runtime());
@@ -6744,4 +6747,37 @@ fn threads_panel_renders_thread_group_headers() {
     assert!(rendered.contains("Thread 200 (1 msg)"));
     assert!(rendered.contains("thread a root"));
     assert!(rendered.contains("thread b root"));
+}
+
+#[test]
+fn following_thread_group_headers_render_recipient_badges() {
+    let runtime = test_runtime_with_imap();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread_in_thread(
+            100,
+            1,
+            "thread a root",
+            "a-root@example.com",
+            0,
+        )],
+        runtime.clone(),
+    );
+    state.active_thread_mailbox = IMAP_INBOX_MAILBOX.to_string();
+    state.following_kinds.insert(
+        100,
+        vec![
+            crate::domain::following::FollowingKind::ToMe,
+            crate::domain::following::FollowingKind::CcMe,
+            crate::domain::following::FollowingKind::SentPatch,
+        ],
+    );
+    state.focus = Pane::Threads;
+
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw Following frame");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("follow=TO,CC,SENT"));
 }

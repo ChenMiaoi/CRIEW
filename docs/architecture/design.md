@@ -40,7 +40,7 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
 
 ### 2.1 目标
 
-- 收取邮件：支持真实 IMAP 同步 patch 相关邮件，并可默认接入自己的 `INBOX`。
+- 收取邮件：支持真实 IMAP 同步 patch 相关邮件，并通过虚拟 `Following` 视图发现与自己有关的邮件。
 - 发送邮件：支持 SMTP 发送 reply / patch cover letter。
 - 邮件解析：支持 RFC 5322 头解析、MIME 多 part、附件提取。
 - Patch 处理：识别 `[PATCH vN M/N]`、series 分组、导出/应用 patch。
@@ -131,6 +131,11 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
   - `is_expunged`
 - `mail_ref`
   - `mail_id`, `ref_message_id`, `ord`（来自 `References` 的有序引用链）
+- `mail_recipient`
+  - `mail_id`, `kind`（from/to/cc）, `address`, `ord`；用于按自身邮箱地址检索关注更新
+- `following_update`
+  - `mail_id`, `thread_id`, `kind`（to_me/cc_me/sent_patch）, `occurred_at`, `seen_at`
+  - 将收件人命中和本地已发 patch 物化为可聚合的 Following 更新记录
 - `thread`
   - `id`, `root_mail_id`, `subject_norm`, `last_activity_at`, `message_count`
 - `thread_node`
@@ -162,6 +167,8 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
 - `thread_node(thread_id, sort_ts)` 索引
 - `thread_node(parent_mail_id)` 索引
 - `patch_series(status, author)` 组合索引
+- `mail_recipient(address, kind, mail_id)` 组合索引
+- `following_update(thread_id, occurred_at)` 与 `(kind, occurred_at)` 索引
 - `imap_mailbox_state(mailbox)` 唯一索引
 
 ## 7. 核心流程
@@ -169,15 +176,16 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
 ### 7.1 同步与建索引
 
 - 同步目标由“已启用订阅”决定，但按 `source` 分流：
-  `My Inbox` 使用 `source=imap`，子系统模板继续使用 `source=lore`。
-- 对于内置 `My Inbox`，固定映射到 IMAP `INBOX`。
+  `Following` 使用 `source=imap`，子系统模板继续使用 `source=lore`。
+- `Following` 是虚拟视图，固定映射到 IMAP `INBOX`；`INBOX` 只作为隐藏后端源，
+  不在左栏作为第二个可见订阅。
 - 自身邮箱地址解析优先级固定为：`[imap].email` -> `git config user.email`。
   `user` 用于 IMAP 认证；若未显式设置，则回退到 `[imap].email` 作为登录身份。
 - 真实 IMAP 连接要求 `user`、`pass`、`server`、`serverport`、`encryption`
   五项齐备；`encryption` 首版固定枚举 `tls` / `starttls` / `none`。
 
 1. 解析已启用订阅，并按 `source` 分成 `imap_subscriptions` 与 `lore_subscriptions`。
-2. 对 `imap_subscriptions`：`My Inbox` 使用 `INBOX`，基于 `[imap]` 配置建立 IMAP 会话，
+2. 对 `imap_subscriptions`：`Following` 使用 `INBOX`，基于 `[imap]` 配置建立 IMAP 会话，
    按 `encryption` 完成 TLS/STARTTLS/plain 连接并执行最小 `LOGIN` 认证。
 3. `SELECT` 对应 IMAP mailbox，读取 `UIDVALIDITY`、`UIDNEXT`、`HIGHESTMODSEQ`。
 4. 读取本地 `imap_mailbox_state`，对比同步断点。
@@ -185,9 +193,11 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
 6. 按 UID 增量拉取新邮件；若服务器支持，按 MODSEQ 拉取 flag 变更。
 7. 对 `lore_subscriptions`：继续沿用 M2 的网页/lore atom/raw 抓取同步路径，
    不经过 IMAP。
-8. 两类来源的邮件都在单事务中落盘 `.eml`、解析头部、写入 `mail`/`mail_ref`。
+8. 两类来源的邮件都在单事务中落盘 `.eml`、解析头部、写入 `mail`/`mail_ref`/`mail_recipient`。
 9. 基于 JWZ 规则局部更新 `thread`/`thread_node`，并聚合 patch series。
-10. 提交事务并更新对应来源的 checkpoint；IMAP 路径更新
+10. 对 `Following`，IMAP 通过 `UID SEARCH HEADER TO/CC/FROM` 先筛选增量 UID；本地再以
+    规范化邮箱地址生成 `following_update`，分别标记 `TO`、`CC`、`SENT`。
+11. 提交事务并更新对应来源的 checkpoint；IMAP 路径更新
     `last_seen_uid`/`highest_modseq`。
 
 ### 7.2 Patch 提取与应用
@@ -226,19 +236,19 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
 
 主布局三栏：
 
-- 左：订阅可选框（内核子系统邮件列表 + 自己的收件箱）
+- 左：订阅可选框（内核子系统邮件列表 + `Following`）
 - 中：thread 或 series 列表
 - 右：邮件正文/patch diff 预览
 
 左栏订阅可选框：
 
 - 展示形式：以可选框展示订阅项（`[x]` 已启用，`[ ]` 未启用）。
-- 订阅内容：默认提供常见内核子系统邮件列表，并新增一个内置 `My Inbox`
+- 订阅内容：默认提供常见内核子系统邮件列表，并新增一个内置 `Following`
   订阅，映射当前 IMAP 账号的 `INBOX`。
 - 分组规则：按启用状态分为 `enabled` / `disabled` 两组，各组内按字典序排序。
-- 默认状态：IMAP 配置完整时，`My Inbox` 首次默认开启；其余模板订阅默认关闭。
+- 默认状态：IMAP 配置完整时，`Following` 首次默认开启；其余模板订阅默认关闭。
 - 交互规则：支持分组折叠与展开，支持 `y/n` 启停当前订阅。
-- 生效规则：仅拉取和展示已启用订阅对应的邮件流；其中 `My Inbox` 走 IMAP，
+- 生效规则：仅拉取和展示已启用订阅对应的邮件流；其中 `Following` 走 IMAP，
   子系统订阅继续走 lore/web 抓取。
 
 命令栏（Command Palette）：
@@ -312,7 +322,7 @@ MVP 范围与阶段目标已迁移至独立文档：
 - 单元测试：标题解析、JWZ thread 构建、过滤规则匹配、`[imap].email` 覆盖
   `git config user.email` 的优先级解析。
 - 集成测试：IMAP 拉取 -> 入库 -> thread 展示 -> patch 应用链路；覆盖默认
-  `My Inbox` 订阅、认证失败与 `UIDVALIDITY` 重建；并覆盖子系统订阅仍走 lore/web。
+  `Following` 订阅、认证失败与 `UIDVALIDITY` 重建；并覆盖子系统订阅仍走 lore/web。
 - 一致性测试：`UIDVALIDITY` 变化、断点恢复、重复拉取去重、EXPUNGE。
 - 端到端测试：使用本地测试邮箱和临时仓库验证完整流程。
 - 回归样本：维护一组真实 `.eml` 样本（含异常 MIME 和破损 patch）。
@@ -364,7 +374,7 @@ MVP 范围与阶段目标已迁移至独立文档：
   `Enter` 打开对应 mailbox Threads。
 - 命令栏支持 `sync` / `sync <mailbox>`，并在启动 TUI 时自动同步“已启用订阅”。
 - UI 状态持久化 `enabled_mailboxes`、分组展开状态、active mailbox 和 mail pane 宽度到 `ui-state.toml`；
-  首次启动默认全部订阅禁用；该基线在 M6 规划中仅对新增 `My Inbox` 订阅例外。
+  首次启动默认全部订阅禁用；该基线在 M6 规划中仅对新增 `Following` 订阅例外。
 - 右栏预览默认隐藏 RFC 头部，过滤控制字符，切换线程时清屏并重置滚动，避免残留字符。
 
 ### 15.2 风险与后续动作
@@ -412,9 +422,11 @@ MVP 范围与阶段目标已迁移至独立文档：
   语义，`user` 用于认证，二者允许不同。
 - 自身邮箱地址解析优先级固定为：`[imap].email` -> `git config user.email`；
   若 CRIEW 配置存在，则覆盖 git 结果，并在 `doctor` 中显示最终来源。
-- TUI 左栏新增内置 `My Inbox` 订阅，映射 IMAP `INBOX`，在 IMAP 配置完整时
-  默认启用并参与启动自动同步；TUI 保持打开期间，`My Inbox` 继续按
+- TUI 左栏新增内置 `Following` 订阅，映射 IMAP `INBOX`，在 IMAP 配置完整时
+  默认启用并参与启动自动同步；TUI 保持打开期间，`Following` 继续按
   `ui.inbox_auto_sync_interval_secs` 指定的间隔做后台增量同步，默认 30 秒。
+  通过 `To`、`Cc`、自身 `From` 的 header search 发现邮件，并将独立发送的 patch
+  记录为 `SENT` 更新；线程行显示 `TO`/`CC`/`SENT` 标记。
   其余 vger 模板订阅仍保持默认禁用，并继续使用 lore/web 抓取，不切换到 IMAP。
 - 真实 IMAP 客户端首版覆盖 `LOGIN`、`SELECT`、`UID SEARCH`、`UID FETCH`
   最小链路，并复用既有 checkpoint、幂等写入和 `UIDVALIDITY` 重建逻辑。
@@ -427,7 +439,7 @@ MVP 范围与阶段目标已迁移至独立文档：
 - `pass`（或 legacy alias `imappass`）暂存于配置文件存在凭据泄露风险；
   M6 以最小可用为先，后续应迁移到
   keyring 或 secret backend。
-- 默认启用 `My Inbox` 会改变“首次启动默认全禁用”的旧行为；迁移策略应固定为：
+- 默认启用 `Following` 会改变“首次启动默认全禁用”的旧行为；迁移策略应固定为：
   对已有 `ui-state.toml` 用户保持原状态，仅对首次引入 IMAP 配置或新用户自动开启。
 
 ## 18. M7（已完成）：回信编辑与预览

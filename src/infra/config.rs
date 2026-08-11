@@ -16,6 +16,7 @@ use crate::infra::error::{CriewError, ErrorCode, Result};
 
 pub const DEFAULT_SOURCE_MAILBOX: &str = "linux-kernel";
 pub const IMAP_INBOX_MAILBOX: &str = "INBOX";
+pub const FOLLOWING_VIEW: &str = "Following";
 pub const DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS: u64 = 30;
 const DEFAULT_LORE_BASE_URL: &str = "https://lore.kernel.org";
 const DEFAULT_RUNTIME_DIR_NAME: &str = ".criew";
@@ -207,6 +208,8 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     pub fn default_active_mailbox(&self) -> &str {
         if self.imap.is_complete() {
+            // Keep the historical backend name in persisted/runtime state;
+            // the TUI renders this mailbox as the virtual Following view.
             IMAP_INBOX_MAILBOX
         } else {
             &self.source_mailbox

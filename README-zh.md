@@ -24,6 +24,8 @@ English README: [README.md](README.md)
 cargo install criew
 criew doctor
 criew sync --mailbox io-uring
+# 通过 IMAP 邮件头检索同步虚拟的个人关注视图。
+criew sync --mailbox Following
 # 按 Message-ID 补齐完整对话，并重建本地 thread。
 criew fetch-thread --mailbox io-uring '<reply@example.com>'
 # 列出还没有 Reviewed-by trailer 的 patch series。
@@ -34,6 +36,12 @@ criew preflight --mailbox io-uring '<patch@example.com>'
 criew outbox
 criew tui
 ```
+
+配置好 IMAP 后，TUI 会用虚拟视图 `Following（关注）` 替代单独的个人收件箱订阅。
+它使用配置的自身邮箱地址检索邮件头：发给你的邮件（`To`）、抄送给你的邮件（`Cc`），
+以及你发送的 patch，会按 thread 形成额外的更新记录，并显示 `TO`、`CC`、`SENT`
+标记。CRIEW 实际检索并同步 IMAP `INBOX`，但 `INBOX` 只是内部数据源，不会再作为第二个
+可见订阅出现。
 
 如果增量同步只拿到了一部分对话，可以对其中任意一封邮件的
 `Message-ID` 运行 `fetch-thread`。命令会沿着 `References`/`In-Reply-To`

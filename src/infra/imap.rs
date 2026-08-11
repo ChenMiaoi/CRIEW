@@ -83,6 +83,16 @@ pub trait ImapClient {
         self.fetch_incremental(mailbox, after_uid, since_modseq)
     }
 
+    fn fetch_following_incremental(
+        &mut self,
+        mailbox: &str,
+        _self_email: &str,
+        after_uid: u32,
+        since_modseq: Option<u64>,
+    ) -> Result<Vec<RemoteMail>> {
+        self.fetch_incremental(mailbox, after_uid, since_modseq)
+    }
+
     fn fetch_full_uids(&mut self, mailbox: &str, uids: &[u32]) -> Result<Vec<RemoteMail>> {
         let wanted: HashSet<u32> = uids.iter().copied().collect();
         let mut mails = self.fetch_incremental(mailbox, 0, None)?;
@@ -891,8 +901,37 @@ impl ImapClient for RemoteImapClient {
         let uids = collect_incremental_uids(session, snapshot, after_uid, since_modseq)?;
         session.fetch_uids(
             &uids,
-            "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM DATE IN-REPLY-TO REFERENCES LIST-ID)]",
+            "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM TO CC DATE IN-REPLY-TO REFERENCES LIST-ID)]",
         )
+    }
+
+    fn fetch_following_incremental(
+        &mut self,
+        mailbox: &str,
+        self_email: &str,
+        after_uid: u32,
+        since_modseq: Option<u64>,
+    ) -> Result<Vec<RemoteMail>> {
+        let session = self.session_mut()?;
+        let snapshot = session.select_mailbox(mailbox)?;
+        let incremental_uids =
+            collect_incremental_uids(session, snapshot, after_uid, since_modseq)?;
+        if incremental_uids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let incremental_set: HashSet<u32> = incremental_uids.into_iter().collect();
+        let mut matching_uids = BTreeSet::new();
+        for header in ["TO", "CC", "FROM"] {
+            for uid in session.search_header_value(header, self_email)? {
+                if incremental_set.contains(&uid) {
+                    matching_uids.insert(uid);
+                }
+            }
+        }
+
+        let matching_uids: Vec<u32> = matching_uids.into_iter().collect();
+        session.fetch_uids(&matching_uids, "BODY.PEEK[]")
     }
 
     fn fetch_full_uids(&mut self, mailbox: &str, uids: &[u32]) -> Result<Vec<RemoteMail>> {
@@ -1250,6 +1289,13 @@ impl ImapSession {
         self.search_uids(&format!(
             "UID SEARCH HEADER {header} {}",
             quote_imap_string(&format!("<{value}>"))
+        ))
+    }
+
+    fn search_header_value(&mut self, header: &str, value: &str) -> Result<Vec<u32>> {
+        self.search_uids(&format!(
+            "UID SEARCH HEADER {header} {}",
+            quote_imap_string(value)
         ))
     }
 
@@ -4062,6 +4108,41 @@ mod tests {
                 .map(|mail| mail.uid)
                 .collect::<Vec<_>>(),
             vec![7]
+        );
+
+        let mut following_client = RemoteImapClient {
+            config: config.clone(),
+            session: Some(ImapSession::with_mock_stream(MockStream::with_reads(
+                concat!(
+                    "* OK [UIDVALIDITY 11] valid\r\n",
+                    "* OK [UIDNEXT 4] next\r\n",
+                    "* OK [HIGHESTMODSEQ 22] modseq\r\n",
+                    "A0001 OK select\r\n",
+                    "* SEARCH 2 3\r\n",
+                    "A0002 OK search\r\n",
+                    "* SEARCH 2\r\n",
+                    "A0003 OK search\r\n",
+                    "* SEARCH 3\r\n",
+                    "A0004 OK search\r\n",
+                    "* SEARCH 9\r\n",
+                    "A0005 OK search\r\n",
+                    "* 1 FETCH (UID 2 FLAGS (\\Seen) MODSEQ (21) BODY.PEEK[] {5}\r\n",
+                    "hello\r\n",
+                    ")\r\n",
+                    "* 2 FETCH (UID 3 FLAGS (\\Seen) MODSEQ (22) BODY.PEEK[] {5}\r\n",
+                    "world\r\n",
+                    ")\r\n",
+                    "A0006 OK fetch\r\n"
+                )
+                .as_bytes(),
+            ))),
+        };
+        let following = following_client
+            .fetch_following_incremental("INBOX", "me@example.com", 1, None)
+            .expect("delegate Following search fetch");
+        assert_eq!(
+            following.iter().map(|mail| mail.uid).collect::<Vec<_>>(),
+            vec![2, 3]
         );
 
         let mut full_uid_client = RemoteImapClient {

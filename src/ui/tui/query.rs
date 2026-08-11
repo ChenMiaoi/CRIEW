@@ -230,6 +230,7 @@ mod tests {
             thread_id: 1,
             mail_id: 1,
             depth: 0,
+            mailbox: "io-uring".to_string(),
             subject: subject.to_string(),
             from_addr: from.to_string(),
             message_id: message_id.to_string(),

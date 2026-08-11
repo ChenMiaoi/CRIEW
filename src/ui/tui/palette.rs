@@ -599,10 +599,10 @@ fn sync_completion_suggestions(
     let mut candidates: Vec<String> = state
         .subscriptions
         .iter()
-        .map(|subscription| subscription.mailbox.clone())
+        .map(|subscription| display_mailbox_name(&subscription.mailbox).to_string())
         .collect();
-    candidates.push(state.active_thread_mailbox.clone());
-    candidates.push(state.runtime.source_mailbox.clone());
+    candidates.push(display_mailbox_name(&state.active_thread_mailbox).to_string());
+    candidates.push(display_mailbox_name(&state.runtime.source_mailbox).to_string());
     candidates.sort();
     candidates.dedup();
     candidates

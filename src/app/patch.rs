@@ -248,7 +248,11 @@ pub fn build_series_index(mailbox: &str, threads: &[ThreadRow]) -> HashMap<i64, 
 
     let mut summaries = HashMap::new();
     for (thread_id, rows) in rows_by_thread {
-        if let Some(summary) = analyze_thread_series(mailbox, thread_id, &rows) {
+        let source_mailbox = rows
+            .iter()
+            .find_map(|(_, row)| (!row.mailbox.trim().is_empty()).then_some(row.mailbox.as_str()))
+            .unwrap_or(mailbox);
+        if let Some(summary) = analyze_thread_series(source_mailbox, thread_id, &rows) {
             summaries.insert(thread_id, summary);
         }
     }
@@ -1646,6 +1650,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
             thread_id,
             mail_id,
             depth,
+            mailbox: "io-uring".to_string(),
             subject: subject.to_string(),
             from_addr: "alice@example.com".to_string(),
             message_id: message_id.to_string(),

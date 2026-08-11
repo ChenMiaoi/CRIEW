@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use crate::app::patch as patch_worker;
 use crate::domain::subscriptions::uses_gnu_qemu_archive;
-use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
+use crate::infra::config::{FOLLOWING_VIEW, IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::imap::{
     FixtureImapClient, GnuArchiveClient, ImapClient, LoreImapClient, MailboxSnapshot,
     RemoteImapClient, RemoteMail,
 };
-use crate::infra::mail_parser::{self, ParsedMailHeaders};
+use crate::infra::mail_parser::{self, ParsedMailHeaders, normalize_email_address};
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch};
 
 const INITIAL_SYNC_THREAD_LIMIT: usize = 20;
@@ -73,7 +73,9 @@ enum SyncSource {
         fixture_dir: PathBuf,
         uidvalidity_hint: u64,
     },
-    Imap,
+    Following {
+        self_email: String,
+    },
     GnuArchive,
     Lore {
         base_url: String,
@@ -84,7 +86,7 @@ impl SyncSource {
     fn label(&self) -> String {
         match self {
             Self::Fixture { fixture_dir, .. } => fixture_dir.display().to_string(),
-            Self::Imap => "imap".to_string(),
+            Self::Following { .. } => "imap-following".to_string(),
             Self::GnuArchive => "https://lists.gnu.org/archive/mbox".to_string(),
             Self::Lore { base_url } => base_url.clone(),
         }
@@ -174,19 +176,28 @@ fn resolve_sync_source(config: &RuntimeConfig, request: &SyncRequest) -> Result<
         });
     }
 
-    if request.mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
-        // `INBOX` is the only mailbox that depends on private account state, so
-        // treat it as an explicit IMAP-only path and fail fast when credentials
-        // are incomplete instead of silently falling back to lore.
+    if request.mailbox.eq_ignore_ascii_case(FOLLOWING_VIEW)
+        || request.mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
+    {
+        // Following is a virtual view backed by the private IMAP INBOX. Keep
+        // the legacy INBOX spelling accepted for CLI/config compatibility, but
+        // never expose it as a separate user-facing subscription.
         if config.imap.is_complete() {
-            return Ok(SyncSource::Imap);
+            let self_email = crate::infra::config::resolve_self_email(config)
+                .email
+                .ok_or_else(|| {
+                    CriewError::new(
+                        ErrorCode::Imap,
+                        "self email is required for Following discovery; set imap.email or git config user.email",
+                    )
+                })?;
+            return Ok(SyncSource::Following { self_email });
         }
 
         return Err(CriewError::new(
             ErrorCode::Imap,
             format!(
-                "IMAP config is incomplete for {}: missing {}",
-                IMAP_INBOX_MAILBOX,
+                "IMAP config is incomplete for Following: missing {}",
                 config.imap.missing_required_fields().join(", ")
             ),
         ));
@@ -201,13 +212,21 @@ fn resolve_sync_source(config: &RuntimeConfig, request: &SyncRequest) -> Result<
     })
 }
 
+fn storage_mailbox<'a>(mailbox: &'a str, source: &SyncSource) -> &'a str {
+    match source {
+        SyncSource::Following { .. } => IMAP_INBOX_MAILBOX,
+        _ => mailbox,
+    }
+}
+
 fn fetch_thread_once(
     config: &RuntimeConfig,
     mailbox: &str,
     message_id: &str,
     source: &SyncSource,
 ) -> Result<SyncSummary> {
-    let checkpoint = mail_store::load_mailbox_state(&config.database_path, mailbox)?;
+    let storage_mailbox = storage_mailbox(mailbox, source);
+    let checkpoint = mail_store::load_mailbox_state(&config.database_path, storage_mailbox)?;
     let checkpoint_last_seen_uid = checkpoint
         .as_ref()
         .map(|state| state.last_seen_uid)
@@ -220,7 +239,7 @@ fn fetch_thread_once(
             fixture_dir.to_path_buf(),
             *uidvalidity_hint,
         )),
-        SyncSource::Imap => Box::new(RemoteImapClient::new(config.imap.clone())?),
+        SyncSource::Following { .. } => Box::new(RemoteImapClient::new(config.imap.clone())?),
         SyncSource::GnuArchive => Box::new(GnuArchiveClient::new(None)?),
         SyncSource::Lore { base_url } => Box::new(LoreImapClient::new(Some(base_url))?),
     };
@@ -240,10 +259,10 @@ fn fetch_thread_once(
                 highest_modseq: checkpoint.as_ref().and_then(|state| state.highest_modseq),
             }
         }
-        _ => client.select_mailbox(mailbox)?,
+        _ => client.select_mailbox(storage_mailbox)?,
     };
-    let remote_messages = client.fetch_thread(mailbox, message_id)?;
-    let envelopes = parse_remote_messages(mailbox, remote_messages);
+    let remote_messages = client.fetch_thread(storage_mailbox, message_id)?;
+    let envelopes = parse_remote_messages(storage_mailbox, remote_messages);
     let requested_message_id = normalize_requested_message_id(message_id);
     if !envelopes
         .iter()
@@ -265,9 +284,9 @@ fn fetch_thread_once(
             remote.uid = synthetic_uid;
         }
 
-        let raw_path = persist_raw_mail(config, mailbox, remote.uid, &remote.raw)?;
+        let raw_path = persist_raw_mail(config, storage_mailbox, remote.uid, &remote.raw)?;
         incoming.push(IncomingMail {
-            mailbox: mailbox.to_string(),
+            mailbox: storage_mailbox.to_string(),
             uid: remote.uid,
             modseq: remote.modseq,
             flags: remote.flags,
@@ -291,16 +310,19 @@ fn fetch_thread_once(
     let write_result = mail_store::apply_sync_batch(
         &config.database_path,
         SyncBatch {
-            mailbox: mailbox.to_string(),
+            mailbox: storage_mailbox.to_string(),
             uidvalidity: snapshot.uidvalidity,
             highest_uid: batch_highest_uid,
             highest_modseq: batch_highest_modseq,
             mails: incoming,
         },
     )?;
+    if let SyncSource::Following { self_email } = source {
+        mail_store::refresh_following_updates(&config.database_path, self_email)?;
+    }
 
     Ok(SyncSummary {
-        mailbox: write_result.state.mailbox.clone(),
+        mailbox: mailbox.to_string(),
         source: source.label(),
         fetched,
         inserted: write_result.inserted,
@@ -315,12 +337,14 @@ fn fetch_thread_once(
 }
 
 fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Result<SyncSummary> {
-    let checkpoint = mail_store::load_mailbox_state(&config.database_path, mailbox)?;
+    let storage_mailbox = storage_mailbox(mailbox, source);
+    let checkpoint = mail_store::load_mailbox_state(&config.database_path, storage_mailbox)?;
     let checkpoint_last_seen_uid = checkpoint
         .as_ref()
         .map(|state| state.last_seen_uid)
         .unwrap_or(0);
-    let mailbox_message_count = mail_store::mailbox_message_count(&config.database_path, mailbox)?;
+    let mailbox_message_count =
+        mail_store::mailbox_message_count(&config.database_path, storage_mailbox)?;
     // An empty mailbox gets a different startup path because paying the cost of
     // a bounded initial window is better than downloading an entire busy inbox
     // before the first TUI frame appears.
@@ -334,13 +358,13 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
             fixture_dir.to_path_buf(),
             *uidvalidity_hint,
         )),
-        SyncSource::Imap => Box::new(RemoteImapClient::new(config.imap.clone())?),
+        SyncSource::Following { .. } => Box::new(RemoteImapClient::new(config.imap.clone())?),
         SyncSource::GnuArchive => Box::new(GnuArchiveClient::new(None)?),
         SyncSource::Lore { base_url } => Box::new(LoreImapClient::new(Some(base_url))?),
     };
 
     client.connect()?;
-    let snapshot = client.select_mailbox(mailbox)?;
+    let snapshot = client.select_mailbox(storage_mailbox)?;
 
     let mailbox_rebuilt = checkpoint
         .as_ref()
@@ -358,18 +382,23 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         checkpoint.as_ref().and_then(|state| state.highest_modseq)
     };
 
-    // `My Inbox` can contain a large amount of unrelated mail. On the very
-    // first sync we inspect headers first so we can bound startup latency and
-    // only fetch full raws for the latest patch-related threads.
+    // The hidden IMAP INBOX can contain a large amount of unrelated mail. On
+    // the very first fixture sync we inspect headers first so we can bound
+    // startup latency and only fetch full raws for the latest patch threads.
     let initial_inbox_selection = if initial_window_sync
-        && mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
+        && matches!(source, SyncSource::Fixture { .. })
+        && storage_mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
     {
-        let header_candidates = client.fetch_header_candidates(mailbox, after_uid, since_modseq)?;
-        let selection =
-            select_initial_inbox_messages(mailbox, header_candidates, INITIAL_SYNC_THREAD_LIMIT);
+        let header_candidates =
+            client.fetch_header_candidates(storage_mailbox, after_uid, since_modseq)?;
+        let selection = select_initial_inbox_messages(
+            storage_mailbox,
+            header_candidates,
+            INITIAL_SYNC_THREAD_LIMIT,
+        );
         tracing::info!(
             op = "inbox_initial_sync",
-            mailbox = %mailbox,
+            mailbox = %storage_mailbox,
             status = "selected",
             scanned = selection.scanned,
             patch_related = selection.patch_related,
@@ -382,13 +411,30 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     };
 
     let remote_messages = if let Some(selection) = initial_inbox_selection.as_ref() {
-        client.fetch_full_uids(mailbox, &selection.selected_uids)?
+        client.fetch_full_uids(storage_mailbox, &selection.selected_uids)?
+    } else if let SyncSource::Following { self_email } = source {
+        client.fetch_following_incremental(storage_mailbox, self_email, after_uid, since_modseq)?
     } else {
-        client.fetch_incremental(mailbox, after_uid, since_modseq)?
+        client.fetch_incremental(storage_mailbox, after_uid, since_modseq)?
     };
 
-    let mut envelopes = parse_remote_messages(mailbox, remote_messages);
-    if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+    let mut envelopes = parse_remote_messages(storage_mailbox, remote_messages);
+    if let SyncSource::Following { self_email } = source {
+        let before = envelopes.len();
+        envelopes.retain(|envelope| is_following_match(&envelope.parsed, self_email));
+        let filtered_out = before.saturating_sub(envelopes.len());
+        if filtered_out > 0 {
+            tracing::info!(
+                op = "following_filter",
+                mailbox = %storage_mailbox,
+                status = "filtered",
+                kept = envelopes.len(),
+                filtered_out
+            );
+        }
+    } else if matches!(source, SyncSource::Fixture { .. })
+        && storage_mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
+    {
         let before = envelopes.len();
         envelopes
             .retain(|envelope| patch_worker::subject_is_patch_related(&envelope.parsed.subject));
@@ -396,7 +442,7 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         if filtered_out > 0 {
             tracing::info!(
                 op = "inbox_filter",
-                mailbox = %mailbox,
+                mailbox = %storage_mailbox,
                 status = "filtered",
                 rule = "patch_related",
                 kept = envelopes.len(),
@@ -422,10 +468,10 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
             remote.uid = synthetic_uid;
         }
 
-        let raw_path = persist_raw_mail(config, mailbox, remote.uid, &remote.raw)?;
+        let raw_path = persist_raw_mail(config, storage_mailbox, remote.uid, &remote.raw)?;
 
         incoming.push(IncomingMail {
-            mailbox: mailbox.to_string(),
+            mailbox: storage_mailbox.to_string(),
             uid: remote.uid,
             modseq: remote.modseq,
             flags: remote.flags,
@@ -453,14 +499,19 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     let write_result = mail_store::apply_sync_batch(
         &config.database_path,
         SyncBatch {
-            mailbox: mailbox.to_string(),
+            mailbox: storage_mailbox.to_string(),
             uidvalidity: snapshot.uidvalidity,
             highest_uid: batch_highest_uid,
             highest_modseq: batch_highest_modseq,
             mails: incoming,
         },
     )?;
-    if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+    if let SyncSource::Following { self_email } = source {
+        mail_store::refresh_following_updates(&config.database_path, self_email)?;
+    }
+    if matches!(source, SyncSource::Fixture { .. })
+        && storage_mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
+    {
         // The initial header scan is only an optimization. Pruning after the
         // write keeps later incremental syncs from slowly reintroducing
         // unrelated mail into the patch-focused inbox view.
@@ -471,7 +522,7 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         if pruned > 0 {
             tracing::info!(
                 op = "inbox_filter",
-                mailbox = %mailbox,
+                mailbox = %storage_mailbox,
                 status = "pruned",
                 rule = "patch_related",
                 pruned
@@ -480,7 +531,7 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     }
 
     Ok(SyncSummary {
-        mailbox: write_result.state.mailbox.clone(),
+        mailbox: mailbox.to_string(),
         source: source.label(),
         fetched,
         inserted: write_result.inserted,
@@ -514,6 +565,35 @@ fn parse_remote_messages(
             RemoteMailEnvelope { remote, parsed }
         })
         .collect()
+}
+
+fn is_following_match(parsed: &ParsedMailHeaders, self_email: &str) -> bool {
+    let Some(self_email) = normalize_email_address(self_email) else {
+        return false;
+    };
+
+    let matches_to = parsed
+        .to_addresses
+        .iter()
+        .filter_map(|address| normalize_email_address(address))
+        .any(|address| address == self_email);
+    let matches_cc = parsed
+        .cc_addresses
+        .iter()
+        .filter_map(|address| normalize_email_address(address))
+        .any(|address| address == self_email);
+    let is_sent_patch = normalize_email_address(&parsed.from_addr)
+        .is_some_and(|address| address == self_email)
+        && is_sent_patch_subject(&parsed.subject);
+
+    matches_to || matches_cc || is_sent_patch
+}
+
+fn is_sent_patch_subject(subject: &str) -> bool {
+    let normalized = subject.trim().to_ascii_lowercase();
+    !normalized.starts_with("re:")
+        && !normalized.starts_with("fwd:")
+        && patch_worker::subject_is_patch_related(subject)
 }
 
 fn normalize_requested_message_id(value: &str) -> String {
@@ -1011,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn my_inbox_routes_to_real_imap_when_config_is_complete() {
+    fn following_routes_to_real_imap_when_config_is_complete() {
         let runtime = RuntimeConfig {
             config_path: PathBuf::from("/tmp/criew-sync-route.toml"),
             data_dir: PathBuf::from("/tmp/criew-sync-route-data"),
@@ -1052,7 +1132,52 @@ mod tests {
         )
         .expect("resolve source");
 
-        assert!(matches!(source, SyncSource::Imap));
+        assert!(matches!(source, SyncSource::Following { .. }));
+    }
+
+    #[test]
+    fn following_view_name_routes_to_real_imap_when_config_is_complete() {
+        let runtime = RuntimeConfig {
+            config_path: PathBuf::from("/tmp/criew-sync-route.toml"),
+            data_dir: PathBuf::from("/tmp/criew-sync-route-data"),
+            database_path: PathBuf::from("/tmp/criew-sync-route.db"),
+            raw_mail_dir: PathBuf::from("/tmp/criew-sync-route-raw"),
+            patch_dir: PathBuf::from("/tmp/criew-sync-route-patches"),
+            log_dir: PathBuf::from("/tmp/criew-sync-route-logs"),
+            b4_path: None,
+            log_filter: "info".to_string(),
+            source_mailbox: "io-uring".to_string(),
+            imap: crate::infra::config::ImapConfig {
+                email: Some("me@example.com".to_string()),
+                user: Some("imap-user".to_string()),
+                pass: Some("imap-pass".to_string()),
+                server: Some("imap.example.com".to_string()),
+                server_port: Some(993),
+                encryption: Some(crate::infra::config::ImapEncryption::Tls),
+                proxy: None,
+            },
+            lore_base_url: "https://lore.kernel.org".to_string(),
+            startup_sync: true,
+            ui_keymap: crate::infra::config::UiKeymap::Default,
+            ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
+            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
+            inbox_auto_sync_interval_secs:
+                crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            kernel_trees: Vec::new(),
+        };
+
+        let source = resolve_sync_source(
+            &runtime,
+            &SyncRequest {
+                mailbox: crate::infra::config::FOLLOWING_VIEW.to_string(),
+                fixture_dir: None,
+                uidvalidity: None,
+                reconnect_attempts: 1,
+            },
+        )
+        .expect("resolve Following source");
+
+        assert!(matches!(source, SyncSource::Following { .. }));
     }
 
     #[test]

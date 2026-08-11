@@ -11,6 +11,8 @@ pub struct ParsedMailHeaders {
     pub message_id: String,
     pub subject: String,
     pub from_addr: String,
+    pub to_addresses: Vec<String>,
+    pub cc_addresses: Vec<String>,
     pub date: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
@@ -50,10 +52,19 @@ pub fn parse_headers(raw: &[u8], fallback_message_id: String) -> ParsedMailHeade
     let mut dedup = HashSet::new();
     references.retain(|id| dedup.insert(id.clone()));
 
+    let to_addresses = header_value(&headers, "to")
+        .map(|value| parse_address_list(&value))
+        .unwrap_or_default();
+    let cc_addresses = header_value(&headers, "cc")
+        .map(|value| parse_address_list(&value))
+        .unwrap_or_default();
+
     ParsedMailHeaders {
         message_id,
         subject: header_value(&headers, "subject").unwrap_or_default(),
         from_addr: header_value(&headers, "from").unwrap_or_default(),
+        to_addresses,
+        cc_addresses,
         date: header_value(&headers, "date").filter(|value| !value.is_empty()),
         in_reply_to,
         references,
@@ -216,6 +227,79 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, value)| value.trim().to_string())
 }
 
+/// Parse RFC-style display-name addresses into normalized mailbox values.
+///
+/// CRIEW only needs the mailbox part for matching a user's identity. The
+/// parser still tracks quoted strings and angle brackets so a display name or
+/// a quoted comma does not split one recipient into multiple values.
+pub fn parse_address_list(raw: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut angle_depth = 0usize;
+
+    for character in raw.chars() {
+        match character {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(character);
+            }
+            '<' if !in_quotes => {
+                angle_depth = angle_depth.saturating_add(1);
+                current.push(character);
+            }
+            '>' if !in_quotes => {
+                angle_depth = angle_depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' if !in_quotes && angle_depth == 0 => {
+                push_normalized_address(&mut values, &current);
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+
+    push_normalized_address(&mut values, &current);
+    values
+}
+
+/// Normalize one display-name or bare mailbox value for identity matching.
+pub fn normalize_email_address(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let candidate = trimmed
+        .rfind('<')
+        .and_then(|start| trimmed[start + 1..].find('>').map(|end| (start, end)))
+        .map(|(start, end)| &trimmed[start + 1..start + 1 + end])
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_matches(['"', '\'', '<', '>', ',', ';']);
+
+    let candidate = candidate
+        .split_whitespace()
+        .find(|part| part.contains('@'))
+        .unwrap_or(candidate)
+        .trim_matches(['"', '\'', '<', '>', ',', ';']);
+
+    if candidate.is_empty()
+        || !candidate.contains('@')
+        || candidate.contains(['<', '>', '"', '\'', '\n', '\r'])
+    {
+        return None;
+    }
+
+    Some(candidate.to_ascii_lowercase())
+}
+
+fn push_normalized_address(values: &mut Vec<String>, raw: &str) {
+    let Some(address) = normalize_email_address(raw) else {
+        return;
+    };
+    if !values.iter().any(|value| value == &address) {
+        values.push(address);
+    }
+}
+
 fn parse_message_ids(raw: &str) -> Vec<String> {
     let mut ids = Vec::new();
 
@@ -270,14 +354,16 @@ fn normalize_message_id(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_subject, parse_headers};
+    use super::{normalize_email_address, normalize_subject, parse_address_list, parse_headers};
 
     #[test]
     fn parses_basic_headers_and_reference_chain() {
-        let raw = b"Message-ID: <root@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nReferences: <a@example.com> <b@example.com>\r\nIn-Reply-To: <b@example.com>\r\n\r\nbody\r\n";
+        let raw = b"Message-ID: <root@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nCc: List <list@example.com>\r\nReferences: <a@example.com> <b@example.com>\r\nIn-Reply-To: <b@example.com>\r\n\r\nbody\r\n";
 
         let parsed = parse_headers(raw, "fallback@example.com".to_string());
         assert_eq!(parsed.message_id, "root@example.com");
+        assert_eq!(parsed.to_addresses, vec!["bob@example.com"]);
+        assert_eq!(parsed.cc_addresses, vec!["list@example.com"]);
         assert_eq!(parsed.in_reply_to.as_deref(), Some("b@example.com"));
         assert_eq!(parsed.references, vec!["a@example.com", "b@example.com"]);
     }
@@ -335,5 +421,17 @@ mod tests {
 
         assert_eq!(parsed.trailers[0].value, "Alice <alice@example.com>");
         assert_eq!(parsed.trailers[1].kind, "Signed-off-by");
+    }
+
+    #[test]
+    fn parses_quoted_commas_and_bare_addresses() {
+        assert_eq!(
+            parse_address_list("\"Kernel, Bot\" <bot@example.com>, reviewer@example.com"),
+            vec!["bot@example.com", "reviewer@example.com"]
+        );
+        assert_eq!(
+            normalize_email_address("Alice <ALICE@EXAMPLE.COM>"),
+            Some("alice@example.com".to_string())
+        );
     }
 }

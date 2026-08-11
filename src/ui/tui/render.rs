@@ -244,7 +244,10 @@ fn header_context_text(state: &AppState) -> String {
         UiPage::Mail => "Mail",
         UiPage::CodeBrowser => "Code",
     };
-    let context = format!("{page_label} / {}", state.active_thread_mailbox);
+    let context = format!(
+        "{page_label} / {}",
+        display_mailbox_name(&state.active_thread_mailbox)
+    );
     state
         .review_inbox_mode
         .map(|mode| {
@@ -457,6 +460,7 @@ fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     visible_count,
                     state.series_summaries.get(&row.thread_id),
                     state.review_summaries.get(&row.thread_id),
+                    state.following_kinds.get(&row.thread_id).map(Vec::as_slice),
                 ))
                 .style(
                     Style::default()
@@ -491,6 +495,7 @@ fn thread_group_line(
     visible_count: usize,
     series: Option<&patch_worker::SeriesSummary>,
     review: Option<&review_worker::ReviewInboxEntry>,
+    following: Option<&[FollowingKind]>,
 ) -> String {
     let noun = if visible_count == 1 { "msg" } else { "msgs" };
     let mut line = format!("Thread {thread_id} ({visible_count} {noun})");
@@ -510,6 +515,16 @@ fn thread_group_line(
             review.status_label(),
             review.review_count()
         ));
+    }
+    if let Some(following) = following
+        && !following.is_empty()
+    {
+        let labels = following
+            .iter()
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>()
+            .join(",");
+        line.push_str(&format!(" | follow={labels}"));
     }
     line
 }
@@ -842,11 +857,7 @@ fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64)
         ));
     }
 
-    match patch_worker::load_latest_report(
-        &config.database_path,
-        &state.active_thread_mailbox,
-        thread_id,
-    ) {
+    match patch_worker::load_latest_report(&config.database_path, &series.mailbox, thread_id) {
         Ok(Some(report)) => {
             if let Some(summary) = report.last_summary.as_deref() {
                 lines.push(format!("Last run: {summary}"));
