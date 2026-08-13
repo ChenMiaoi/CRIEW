@@ -1995,7 +1995,6 @@ impl AppState {
                 limit,
             );
         }
-
         mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, mailbox, limit)
     }
 

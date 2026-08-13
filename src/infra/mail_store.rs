@@ -471,6 +471,7 @@ FROM thread_node tn
 JOIN thread t ON t.id = tn.thread_id
 JOIN mail m ON m.id = tn.mail_id
 WHERE m.is_expunged = 0
+  AND lower(m.subject) LIKE '%[patch%'
   AND t.id IN (SELECT thread_id FROM followed_threads)
 ORDER BY
     t.last_activity_at DESC,
@@ -1983,7 +1984,7 @@ mod tests {
         assert!(message_ids.contains("to@example.com"));
         assert!(message_ids.contains("cc@example.com"));
         assert!(message_ids.contains("sent@example.com"));
-        assert!(message_ids.contains("unrelated@example.com"));
+        assert!(!message_ids.contains("unrelated@example.com"));
         assert!(!message_ids.contains("sent-reply@example.com"));
 
         let kinds_by_thread = load_following_kinds_by_thread(&db_path, "ME@EXAMPLE.COM")

@@ -886,6 +886,7 @@ fn now_timestamp() -> String {
 mod tests {
     use std::fs;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -949,11 +950,14 @@ mod tests {
             .expect("write staging fake git");
         staging_file.sync_all().expect("sync staging fake git");
         drop(staging_file);
-        let mut permissions = fs::metadata(&staging_path)
-            .expect("staging metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&staging_path, permissions).expect("chmod");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&staging_path)
+                .expect("staging metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&staging_path, permissions).expect("chmod");
+        }
         fs::rename(&staging_path, &path).expect("install fake git");
         path
     }

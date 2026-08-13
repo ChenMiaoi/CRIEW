@@ -1085,6 +1085,17 @@ fn analyze_thread_series(
 pub(crate) fn subject_is_patch_related(subject: &str) -> bool {
     parse_patch_subject_with_reply_mode(subject, true).is_some()
 }
+pub(crate) fn patch_series_signature(subject: &str) -> Option<(u32, u32, u32, String)> {
+    parse_patch_subject_with_reply_mode(subject, true).map(|parsed| {
+        (
+            parsed.version,
+            parsed.seq,
+            parsed.total,
+            parsed.title.trim().to_ascii_lowercase(),
+        )
+    })
+}
+
 
 fn parse_patch_subject(subject: &str) -> Option<ParsedPatchSubject> {
     parse_patch_subject_with_reply_mode(subject, false)
@@ -1813,6 +1824,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
         assert_eq!(summary.status_label(), "conflict");
     }
 
+    #[cfg(unix)]
     #[test]
     fn preflight_runs_kernel_checkers_and_persists_audit() {
         let root = temp_dir("preflight-checkers");
@@ -2147,6 +2159,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
         );
     }
 
+
     #[test]
     fn apply_requires_kernel_tree_configuration() {
         let runtime = runtime_with_kernel_trees(Vec::new());
@@ -2192,6 +2205,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
         assert!(working_dir.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_action_download_records_reviewing_report() {
         let root = temp_dir("run-action-download");
@@ -2234,6 +2248,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_action_apply_marks_conflicts_in_latest_report() {
         let root = temp_dir("run-action-conflict");
@@ -2278,6 +2293,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_action_apply_rejects_noop_success_when_head_does_not_move() {
         let root = temp_dir("run-action-noop");
@@ -2321,6 +2337,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_action_apply_records_head_change_and_moves_artifacts() {
         let root = temp_dir("run-action-apply-success");

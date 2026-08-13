@@ -21,7 +21,6 @@ use crate::infra::imap::{
 use crate::infra::mail_parser::{self, ParsedMailHeaders, normalize_email_address};
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch};
 
-const INITIAL_SYNC_THREAD_LIMIT: usize = 20;
 
 #[derive(Debug)]
 struct RemoteMailEnvelope {
@@ -374,10 +373,13 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     )?;
 
     let mut envelopes = parse_remote_messages(storage_mailbox, remote_messages);
+    complete_incomplete_patch_series(
+        config,
+        client.as_mut(),
+        storage_mailbox,
+        &mut envelopes,
+    )?;
     filter_messages(&mut envelopes, source, storage_mailbox);
-    if initial_window_sync && initial_inbox_selection.is_none() {
-        envelopes = retain_latest_threads(envelopes, INITIAL_SYNC_THREAD_LIMIT);
-    }
 
     let fetched = envelopes.len();
     let write_result = persist_and_write(
@@ -392,6 +394,61 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     prune_fixture_inbox(config, mailbox, storage_mailbox, source)?;
 
     Ok(build_summary(mailbox, source, fetched, write_result))
+}
+fn complete_incomplete_patch_series(
+    _config: &RuntimeConfig,
+    client: &mut dyn ImapClient,
+    mailbox: &str,
+    envelopes: &mut Vec<RemoteMailEnvelope>,
+) -> Result<()> {
+    let mut present = HashSet::new();
+    let mut needs = Vec::new();
+    for envelope in envelopes.iter() {
+        if let Some((version, seq, total, title)) =
+            patch_worker::patch_series_signature(&envelope.parsed.subject)
+        {
+            present.insert((version, seq, title.clone()));
+            needs.push((version, total, title));
+        }
+    }
+    let Some((version, total, title)) = needs.into_iter().find(|(version, total, title)| {
+        *total > 0
+            && present.iter().filter(|(v, _, t)| *v == *version && *t == *title).count()
+                < *total as usize
+    }) else {
+        return Ok(());
+    };
+
+    let candidates = client.fetch_header_candidates(mailbox, 0, None)?;
+    let missing_uids: Vec<u32> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let parsed = mail_parser::parse_headers(&candidate.raw, format!("uid-{}@criew", candidate.uid));
+            let (candidate_version, seq, candidate_total, candidate_title) =
+                patch_worker::patch_series_signature(&parsed.subject)?;
+            (candidate_version == version
+                && candidate_total == total
+                && candidate_title == title
+                && seq > 0
+                && !present.contains(&(candidate_version, seq, candidate_title)))
+                .then_some(candidate.uid)
+        })
+        .collect();
+    if missing_uids.is_empty() {
+        return Ok(());
+    }
+    let fetched = client.fetch_full_uids(mailbox, &missing_uids)?;
+    let known: HashSet<String> = envelopes
+        .iter()
+        .map(|envelope| envelope.parsed.message_id.clone())
+        .collect();
+    for remote in fetched {
+        let parsed = mail_parser::parse_headers(&remote.raw, format!("uid-{}@criew", remote.uid));
+        if !known.contains(&parsed.message_id) {
+            envelopes.push(RemoteMailEnvelope { remote, parsed });
+        }
+    }
+    Ok(())
 }
 
 fn load_checkpoint(
@@ -419,8 +476,7 @@ fn select_initial_inbox(
     }
 
     let header_candidates = client.fetch_header_candidates(mailbox, after_uid, since_modseq)?;
-    let selection =
-        select_initial_inbox_messages(mailbox, header_candidates, INITIAL_SYNC_THREAD_LIMIT);
+    let selection = select_initial_inbox_messages(mailbox, header_candidates);
     tracing::info!(
         op = "inbox_initial_sync",
         mailbox = %mailbox,
@@ -673,30 +729,14 @@ fn normalize_requested_message_id(value: &str) -> String {
 fn select_initial_inbox_messages(
     mailbox: &str,
     remote_messages: Vec<RemoteMail>,
-    thread_limit: usize,
 ) -> InitialInboxSelection {
     let scanned = remote_messages.len();
-    let mut envelopes = parse_remote_messages(mailbox, remote_messages);
-    let message_ids: HashSet<String> = envelopes
-        .iter()
-        .map(|envelope| envelope.parsed.message_id.clone())
-        .collect();
-    // A reply whose referenced root is outside the candidate set is not a
-    // complete thread. Do not spend one of the initial 20 slots on it.
-    envelopes.retain(|envelope| {
-        envelope.parsed.references.is_empty()
-            || envelope
-                .parsed
-                .references
-                .iter()
-                .any(|reference| message_ids.contains(reference))
-    });
-    envelopes.retain(|envelope| patch_worker::subject_is_patch_related(&envelope.parsed.subject));
-    let patch_related = envelopes.len();
-    let selected = retain_latest_threads(envelopes, thread_limit);
+    let mut selected = parse_remote_messages(mailbox, remote_messages);
+    // Header discovery is already the bounded remote operation. Keep every
+    // patch candidate so larger series are never truncated by message count.
+    selected.retain(|envelope| patch_worker::subject_is_patch_related(&envelope.parsed.subject));
+    let patch_related = selected.len();
     let mut index_by_message_id = HashMap::new();
-    // Root detection walks parent chains, so build the lookup map once before
-    // counting distinct threads in the selected working set.
     for (index, message) in selected.iter().enumerate() {
         index_by_message_id.insert(message.parsed.message_id.clone(), index);
     }
@@ -718,62 +758,6 @@ fn select_initial_inbox_messages(
     }
 }
 
-fn retain_latest_threads(
-    messages: Vec<RemoteMailEnvelope>,
-    thread_limit: usize,
-) -> Vec<RemoteMailEnvelope> {
-    if thread_limit == 0 || messages.is_empty() {
-        return Vec::new();
-    }
-
-    let mut index_by_message_id = HashMap::new();
-    for (index, message) in messages.iter().enumerate() {
-        index_by_message_id.insert(message.parsed.message_id.clone(), index);
-    }
-
-    let root_keys: Vec<String> = (0..messages.len())
-        .map(|index| thread_root_key(index, &messages, &index_by_message_id))
-        .collect();
-
-    let mut latest_rank_by_thread = HashMap::new();
-    for (index, root_key) in root_keys.iter().enumerate() {
-        let rank = message_sort_rank(&messages[index]);
-        latest_rank_by_thread
-            .entry(root_key.clone())
-            .and_modify(|existing| {
-                if rank > *existing {
-                    *existing = rank;
-                }
-            })
-            .or_insert(rank);
-    }
-
-    let mut threads: Vec<(String, u64)> = latest_rank_by_thread.into_iter().collect();
-    // Rank threads by their newest activity, then keep ordering deterministic
-    // for equal timestamps so tests and the first-sync window stay stable.
-    threads.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-
-    let selected_roots: HashSet<String> = threads
-        .into_iter()
-        .take(thread_limit)
-        .map(|(root_key, _)| root_key)
-        .collect();
-
-    let mut selected: Vec<RemoteMailEnvelope> = messages
-        .into_iter()
-        .zip(root_keys)
-        .filter_map(|(message, root_key)| {
-            if selected_roots.contains(&root_key) {
-                Some(message)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    selected.sort_by_key(message_sort_rank);
-    selected
-}
 
 fn message_sort_rank(message: &RemoteMailEnvelope) -> u64 {
     let modseq = message.remote.modseq.unwrap_or(0);
@@ -977,26 +961,20 @@ mod tests {
     }
 
     #[test]
-    fn initial_inbox_selection_prefers_latest_twenty_patch_threads() {
+    fn initial_inbox_selection_keeps_all_patch_threads() {
         let remote_messages: Vec<RemoteMail> = (1..=25u32)
             .flat_map(|uid| {
                 let root = RemoteMail {
                     uid: uid * 2 - 1,
                     modseq: Some((uid * 2 - 1) as u64),
                     flags: Vec::new(),
-                    raw: format!(
-                        "Message-ID: <thread-{uid}@example.com>\nSubject: [PATCH 0/1] thread {uid}\nFrom: user{uid}@example.com\n\n"
-                    )
-                    .into_bytes(),
+                    raw: format!("Message-ID: <thread-{uid}@example.com>\nSubject: [PATCH 0/1] thread {uid}\n\n").into_bytes(),
                 };
                 let reply = RemoteMail {
                     uid: uid * 2,
                     modseq: Some((uid * 2) as u64),
                     flags: Vec::new(),
-                    raw: format!(
-                        "Message-ID: <thread-{uid}-reply@example.com>\nSubject: Re: [PATCH 0/1] thread {uid}\nFrom: reply{uid}@example.com\nIn-Reply-To: <thread-{uid}@example.com>\nReferences: <thread-{uid}@example.com>\n\n"
-                    )
-                    .into_bytes(),
+                    raw: format!("Message-ID: <thread-{uid}-reply@example.com>\nSubject: Re: [PATCH 0/1] thread {uid}\nIn-Reply-To: <thread-{uid}@example.com>\nReferences: <thread-{uid}@example.com>\n\n").into_bytes(),
                 };
                 [root, reply]
             })
@@ -1004,19 +982,16 @@ mod tests {
                 uid: 1000,
                 modseq: Some(1000),
                 flags: Vec::new(),
-                raw: b"Message-ID: <status@example.com>\nSubject: Weekly status update\nFrom: noise@example.com\n\n"
-                    .to_vec(),
+                raw: b"Message-ID: <status@example.com>\nSubject: Weekly status update\n\n".to_vec(),
             }))
             .collect();
 
-        let selection = select_initial_inbox_messages("INBOX", remote_messages, 20);
-
+        let selection = select_initial_inbox_messages("INBOX", remote_messages);
         assert_eq!(selection.scanned, 51);
         assert_eq!(selection.patch_related, 50);
-        assert_eq!(selection.selected_threads, 20);
-        assert_eq!(selection.selected_uids.len(), 40);
-        assert!(!selection.selected_uids.contains(&1));
-        assert!(selection.selected_uids.contains(&11));
+        assert_eq!(selection.selected_threads, 25);
+        assert_eq!(selection.selected_uids.len(), 50);
+        assert!(selection.selected_uids.contains(&1));
         assert!(selection.selected_uids.contains(&50));
     }
 
@@ -1092,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_empty_mailbox_sync_keeps_latest_twenty_threads() {
+    fn initial_empty_mailbox_sync_keeps_all_patch_threads() {
         let root = temp_dir("initial-window");
         let fixture_dir = root.join("fixture");
         let data_dir = root.join("data");
@@ -1100,69 +1075,25 @@ mod tests {
         let db_path = data_dir.join("criew.db");
         fs::create_dir_all(&fixture_dir).expect("create fixture dir");
         fs::create_dir_all(&raw_dir).expect("create raw dir");
-
         for uid in 1..=25u32 {
-            fs::write(
-                fixture_dir.join(format!("{uid:04}-thread-{uid}.eml")),
-                format!(
-                    "Message-ID: <thread-{uid}@example.com>\nSubject: [PATCH] thread {uid}\nFrom: user{uid}@example.com\n\nbody {uid}\n"
-                ),
-            )
-            .expect("write fixture");
+            fs::write(fixture_dir.join(format!("{uid:04}-thread-{uid}.eml")), format!("Message-ID: <thread-{uid}@example.com>\nSubject: [PATCH] thread {uid}\n\nbody\n")).expect("write fixture");
         }
-
         db::initialize(&db_path).expect("initialize db");
-
         let runtime = RuntimeConfig {
-            config_path: root.join("config.toml"),
-            data_dir: data_dir.clone(),
-            database_path: db_path.clone(),
-            raw_mail_dir: raw_dir,
-            patch_dir: data_dir.join("patches"),
-            log_dir: data_dir.join("logs"),
-            b4_path: None,
-            log_filter: "info".to_string(),
-            source_mailbox: "inbox".to_string(),
-            imap: crate::infra::config::ImapConfig::default(),
-            lore_base_url: "https://lore.kernel.org".to_string(),
-            startup_sync: true,
-            ui_keymap: crate::infra::config::UiKeymap::Default,
-            ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
-            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
-            inbox_auto_sync_interval_secs:
-                crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
-            kernel_trees: Vec::new(),
+            config_path: root.join("config.toml"), data_dir: data_dir.clone(), database_path: db_path.clone(), raw_mail_dir: raw_dir,
+            patch_dir: data_dir.join("patches"), log_dir: data_dir.join("logs"), b4_path: None, log_filter: "info".to_string(), source_mailbox: "inbox".to_string(),
+            imap: crate::infra::config::ImapConfig::default(), lore_base_url: "https://lore.kernel.org".to_string(), startup_sync: true,
+            ui_keymap: crate::infra::config::UiKeymap::Default, ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
+            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(), inbox_auto_sync_interval_secs: crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS, kernel_trees: Vec::new(),
         };
-
-        let summary = run(
-            &runtime,
-            SyncRequest {
-                mailbox: "inbox".to_string(),
-                fixture_dir: Some(fixture_dir),
-                uidvalidity: Some(1),
-                reconnect_attempts: 1,
-            },
-        )
-        .expect("first sync");
-
-        assert_eq!(summary.fetched, 20);
-        assert_eq!(summary.inserted, 20);
-        assert_eq!(summary.updated, 0);
+        let summary = run(&runtime, SyncRequest { mailbox: "inbox".to_string(), fixture_dir: Some(fixture_dir), uidvalidity: Some(1), reconnect_attempts: 1 }).expect("first sync");
+        assert_eq!(summary.fetched, 25);
+        assert_eq!(summary.inserted, 25);
         assert_eq!(summary.checkpoint_last_seen_uid, 25);
-
-        let rows = mail_store::load_thread_rows_by_mailbox(&db_path, "inbox", 100)
-            .expect("load thread rows");
-        assert_eq!(rows.len(), 20);
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.message_id == "thread-1@example.com")
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.message_id == "thread-25@example.com")
-        );
-
+        let rows = mail_store::load_thread_rows_by_mailbox(&db_path, "inbox", 100).expect("load thread rows");
+        assert_eq!(rows.len(), 25);
+        assert!(rows.iter().any(|row| row.message_id == "thread-1@example.com"));
+        assert!(rows.iter().any(|row| row.message_id == "thread-25@example.com"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1348,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_selection_excludes_reply_without_root_candidate() {
+    fn initial_selection_keeps_patch_reply_without_root_candidate() {
         let messages = vec![
             RemoteMail {
                 uid: 1,
@@ -1363,7 +1294,7 @@ mod tests {
                 raw: b"Message-ID: <root2@example.com>\nSubject: [PATCH] complete\n\n".to_vec(),
             },
         ];
-        let selection = select_initial_inbox_messages("list", messages, 20);
-        assert_eq!(selection.selected_uids, vec![2]);
+        let selection = select_initial_inbox_messages("list", messages);
+        assert_eq!(selection.selected_uids, vec![1, 2]);
     }
 }

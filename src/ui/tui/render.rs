@@ -686,6 +686,18 @@ fn colorize_mail_preview(content: &str) -> Text<'static> {
 
 fn preview_line_style(line: &str, context: &mut PreviewColorContext) -> Style {
     let trimmed = line.trim_start();
+    if let Some(quoted_line) = trimmed.strip_prefix('>').map(str::trim_start)
+        && (quoted_line.starts_with("diff --git ")
+            || quoted_line.starts_with("@@")
+            || quoted_line.starts_with("--- ")
+            || quoted_line.starts_with("+++ ")
+            || (context.in_patch
+                && (quoted_line.starts_with('-')
+                    || quoted_line.starts_with('+')
+                    || quoted_line.starts_with("\\ No newline"))))
+    {
+        return preview_line_style(quoted_line, context);
+    }
     if trimmed.starts_with("```") {
         context.in_code_fence = !context.in_code_fence;
         return Style::default()
@@ -1763,6 +1775,17 @@ mod tests {
         assert_eq!(text.lines[4].spans[0].style.fg, Some(Color::LightRed));
         assert_eq!(text.lines[5].spans[0].style.fg, Some(Color::LightGreen));
         assert_eq!(text.lines[6].spans[0].style.fg, Some(Color::Gray));
+    }
+
+    #[test]
+    fn mail_preview_colorizes_quoted_patch_reply_diff() {
+        let text = colorize_mail_preview(
+            "> diff --git a/a.c b/a.c\n> @@ -1 +1 @@\n> -old\n> +new",
+        );
+        assert_eq!(text.lines[0].spans[0].style.fg, Some(Color::Magenta));
+        assert_eq!(text.lines[1].spans[0].style.fg, Some(Color::LightBlue));
+        assert_eq!(text.lines[2].spans[0].style.fg, Some(Color::LightRed));
+        assert_eq!(text.lines[3].spans[0].style.fg, Some(Color::LightGreen));
     }
 
     #[test]
