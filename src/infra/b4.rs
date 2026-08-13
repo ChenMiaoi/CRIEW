@@ -131,7 +131,7 @@ fn run_with_resolved_program(
     timeout: Duration,
     working_dir: Option<&Path>,
 ) -> Result<B4CommandResult> {
-    let mut command = Command::new(&resolved.command);
+    let mut command = command_for_program(resolved.command.as_ref());
     if let Some(working_dir) = working_dir {
         command.current_dir(working_dir);
     }
@@ -308,7 +308,9 @@ fn run_probe<T>(command: T, label: &Path, command_value: String) -> Probe
 where
     T: AsRef<std::ffi::OsStr>,
 {
-    match output_with_retry(Command::new(command).arg("--version")) {
+    let mut process = command_for_program(command.as_ref());
+    process.arg("--version");
+    match output_with_retry(&mut process) {
         Ok(output) if output.status.success() => {
             let version = normalize_output(&output.stdout)
                 .or_else(|| normalize_output(&output.stderr))
@@ -336,6 +338,27 @@ where
             reason: error.to_string(),
         },
     }
+}
+
+/// Windows does not execute Unix shell scripts directly.  CRIEW ships and
+/// commonly discovers `b4.sh`, so use the user's available POSIX shell as a
+/// transparent launcher while preserving the original path in diagnostics.
+fn command_for_program(program: &std::ffi::OsStr) -> Command {
+    #[cfg(windows)]
+    {
+        let path = Path::new(program);
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sh"))
+        {
+            let mut command = Command::new("sh");
+            command.arg(program);
+            return command;
+        }
+    }
+
+    Command::new(program)
 }
 
 fn output_with_retry(command: &mut Command) -> std::io::Result<std::process::Output> {
@@ -426,7 +449,7 @@ fn render_shell_token(token: &str) -> String {
     }
     if token
         .chars()
-        .all(|character| character.is_ascii_alphanumeric() || "_-./:@".contains(character))
+        .all(|character| character.is_ascii_alphanumeric() || "_-./\\:@".contains(character))
     {
         return token.to_string();
     }
@@ -490,7 +513,27 @@ mod tests {
     }
 
     fn canonicalize_existing_path(path: &Path) -> PathBuf {
-        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        let path = normalize_shell_path(path);
+        fs::canonicalize(&path).unwrap_or(path)
+    }
+
+    #[cfg(windows)]
+    fn normalize_shell_path(path: &Path) -> PathBuf {
+        let text = path.to_string_lossy();
+        if let Some(relative) = text.strip_prefix("/tmp/") {
+            return std::env::temp_dir().join(relative);
+        }
+        if text.len() >= 3 && text.starts_with('/') && text.as_bytes()[2] == b'/' {
+            let drive = text.as_bytes()[1] as char;
+            let relative = text[3..].replace('/', "\\");
+            return PathBuf::from(format!("{}:\\{relative}", drive.to_ascii_uppercase()));
+        }
+        path.to_path_buf()
+    }
+
+    #[cfg(not(windows))]
+    fn normalize_shell_path(path: &Path) -> PathBuf {
+        path.to_path_buf()
     }
 
     fn canonicalized_path_from_output(output: &str, prefix: &str) -> PathBuf {

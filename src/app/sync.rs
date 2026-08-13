@@ -20,7 +20,7 @@ use crate::infra::imap::{
 };
 use crate::infra::mail_parser::{self, ParsedMailHeaders, normalize_email_address};
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch};
-
+use crate::infra::series_store;
 
 #[derive(Debug)]
 struct RemoteMailEnvelope {
@@ -75,6 +75,10 @@ enum SyncSource {
     Following {
         self_email: String,
     },
+    FollowingSent {
+        self_email: String,
+        mailbox: String,
+    },
     GnuArchive,
     Lore {
         base_url: String,
@@ -86,6 +90,7 @@ impl SyncSource {
         match self {
             Self::Fixture { fixture_dir, .. } => fixture_dir.display().to_string(),
             Self::Following { .. } => "imap-following".to_string(),
+            Self::FollowingSent { mailbox, .. } => format!("imap-following-sent:{mailbox}"),
             Self::GnuArchive => "https://lists.gnu.org/archive/mbox".to_string(),
             Self::Lore { base_url } => base_url.clone(),
         }
@@ -95,12 +100,21 @@ impl SyncSource {
         matches!(self, Self::Fixture { .. })
     }
 
-    fn is_following(&self) -> bool {
-        matches!(self, Self::Following { .. })
+    fn is_following_sent(&self) -> bool {
+        matches!(self, Self::FollowingSent { .. })
+    }
+
+    fn following_self_email(&self) -> Option<&str> {
+        match self {
+            Self::Following { self_email } | Self::FollowingSent { self_email, .. } => {
+                Some(self_email)
+            }
+            _ => None,
+        }
     }
 
     fn storage_mailbox<'a>(&self, mailbox: &'a str) -> &'a str {
-        if self.is_following() {
+        if matches!(self, Self::Following { .. }) {
             IMAP_INBOX_MAILBOX
         } else {
             mailbox
@@ -117,6 +131,7 @@ impl SyncSource {
                 *uidvalidity_hint,
             ))),
             Self::Following { .. } => Ok(Box::new(RemoteImapClient::new(config.imap.clone())?)),
+            Self::FollowingSent { .. } => Ok(Box::new(RemoteImapClient::new(config.imap.clone())?)),
             Self::GnuArchive => Ok(Box::new(GnuArchiveClient::new(None)?)),
             Self::Lore { base_url } => Ok(Box::new(LoreImapClient::new(Some(base_url))?)),
         }
@@ -147,13 +162,53 @@ impl SyncSource {
 
 pub fn run(config: &RuntimeConfig, request: SyncRequest) -> Result<SyncSummary> {
     let source = resolve_sync_source(config, &request)?;
-    retry_sync(
+    let mut summary = retry_sync(
         request.reconnect_attempts,
         &request.mailbox,
         &source,
         None,
         || run_once(config, &request.mailbox, &source),
-    )
+    )?;
+
+    if let SyncSource::Following { self_email } = &source
+        && let Some(sent_mailbox) =
+            config
+                .imap
+                .sent_mailbox
+                .as_deref()
+                .map(str::trim)
+                .filter(|mailbox| {
+                    !mailbox.is_empty() && !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
+                })
+    {
+        let sent_source = SyncSource::FollowingSent {
+            self_email: self_email.clone(),
+            mailbox: sent_mailbox.to_string(),
+        };
+        match retry_sync(
+            request.reconnect_attempts,
+            sent_mailbox,
+            &sent_source,
+            None,
+            || run_once(config, sent_mailbox, &sent_source),
+        ) {
+            Ok(sent_summary) => {
+                summary.fetched += sent_summary.fetched;
+                summary.inserted += sent_summary.inserted;
+                summary.updated += sent_summary.updated;
+                summary.rebuilt_roots += sent_summary.rebuilt_roots;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    mailbox = %sent_mailbox,
+                    error = %error,
+                    "optional IMAP sent-mail sync failed; Following INBOX remains available"
+                );
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 pub fn fetch_thread(config: &RuntimeConfig, request: ThreadFetchRequest) -> Result<SyncSummary> {
@@ -373,12 +428,7 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     )?;
 
     let mut envelopes = parse_remote_messages(storage_mailbox, remote_messages);
-    complete_incomplete_patch_series(
-        config,
-        client.as_mut(),
-        storage_mailbox,
-        &mut envelopes,
-    )?;
+    complete_incomplete_patch_series(client.as_mut(), storage_mailbox, &mut envelopes, source)?;
     filter_messages(&mut envelopes, source, storage_mailbox);
 
     let fetched = envelopes.len();
@@ -396,44 +446,72 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     Ok(build_summary(mailbox, source, fetched, write_result))
 }
 fn complete_incomplete_patch_series(
-    _config: &RuntimeConfig,
     client: &mut dyn ImapClient,
     mailbox: &str,
     envelopes: &mut Vec<RemoteMailEnvelope>,
+    source: &SyncSource,
 ) -> Result<()> {
-    let mut present = HashSet::new();
-    let mut needs = Vec::new();
+    type SeriesKey = (u32, u32, String, String, String);
+    let mut present: HashMap<SeriesKey, HashSet<u32>> = HashMap::new();
     for envelope in envelopes.iter() {
+        if is_reply_or_forward_subject(&envelope.parsed.subject) {
+            continue;
+        }
         if let Some((version, seq, total, title)) =
             patch_worker::patch_series_signature(&envelope.parsed.subject)
         {
-            present.insert((version, seq, title.clone()));
-            needs.push((version, total, title));
+            let key = (
+                version,
+                total,
+                normalize_email_address(&envelope.parsed.from_addr).unwrap_or_default(),
+                envelope.parsed.list_id.clone().unwrap_or_default(),
+                series_family_key(&title),
+            );
+            present.entry(key).or_default().insert(seq);
         }
     }
-    let Some((version, total, title)) = needs.into_iter().find(|(version, total, title)| {
-        *total > 0
-            && present.iter().filter(|(v, _, t)| *v == *version && *t == *title).count()
-                < *total as usize
-    }) else {
+    let incomplete: Vec<SeriesKey> = present
+        .iter()
+        .filter_map(|(key, seqs)| (key.1 > 0 && seqs.len() < key.1 as usize).then_some(key.clone()))
+        .collect();
+    if incomplete.is_empty() && !matches!(source, SyncSource::Lore { .. }) {
         return Ok(());
-    };
+    }
+
+    if matches!(source, SyncSource::Lore { .. }) {
+        return complete_lore_patch_threads(client, mailbox, envelopes, &present, &incomplete);
+    }
 
     let candidates = client.fetch_header_candidates(mailbox, 0, None)?;
-    let missing_uids: Vec<u32> = candidates
-        .iter()
-        .filter_map(|candidate| {
-            let parsed = mail_parser::parse_headers(&candidate.raw, format!("uid-{}@criew", candidate.uid));
-            let (candidate_version, seq, candidate_total, candidate_title) =
-                patch_worker::patch_series_signature(&parsed.subject)?;
-            (candidate_version == version
-                && candidate_total == total
-                && candidate_title == title
-                && seq > 0
-                && !present.contains(&(candidate_version, seq, candidate_title)))
-                .then_some(candidate.uid)
-        })
-        .collect();
+    let mut missing_uids = HashSet::new();
+    for candidate in &candidates {
+        let parsed =
+            mail_parser::parse_headers(&candidate.raw, format!("uid-{}@criew", candidate.uid));
+        if is_reply_or_forward_subject(&parsed.subject) {
+            continue;
+        }
+        let Some((candidate_version, seq, candidate_total, candidate_title)) =
+            patch_worker::patch_series_signature(&parsed.subject)
+        else {
+            continue;
+        };
+        let candidate_key = (
+            candidate_version,
+            candidate_total,
+            normalize_email_address(&parsed.from_addr).unwrap_or_default(),
+            parsed.list_id.clone().unwrap_or_default(),
+            series_family_key(&candidate_title),
+        );
+        if incomplete.contains(&candidate_key)
+            && seq > 0
+            && !present
+                .get(&candidate_key)
+                .is_some_and(|seqs| seqs.contains(&seq))
+        {
+            missing_uids.insert(candidate.uid);
+        }
+    }
+    let missing_uids: Vec<u32> = missing_uids.into_iter().collect();
     if missing_uids.is_empty() {
         return Ok(());
     }
@@ -449,6 +527,111 @@ fn complete_incomplete_patch_series(
         }
     }
     Ok(())
+}
+
+fn complete_lore_patch_threads(
+    client: &mut dyn ImapClient,
+    mailbox: &str,
+    envelopes: &mut Vec<RemoteMailEnvelope>,
+    present: &HashMap<(u32, u32, String, String, String), HashSet<u32>>,
+    incomplete: &[(u32, u32, String, String, String)],
+) -> Result<()> {
+    type FamilyKey = (u32, u32, String);
+
+    let mut present_by_family: HashMap<FamilyKey, HashSet<u32>> = HashMap::new();
+    for (key, sequences) in present {
+        present_by_family
+            .entry((key.0, key.1, key.4.clone()))
+            .or_default()
+            .extend(sequences.iter().copied());
+    }
+
+    let incomplete_families: HashSet<FamilyKey> = incomplete
+        .iter()
+        .map(|key| (key.0, key.1, key.4.clone()))
+        .collect();
+    let known_non_reply_ids: HashSet<String> = envelopes
+        .iter()
+        .filter(|envelope| !is_reply_or_forward_subject(&envelope.parsed.subject))
+        .map(|envelope| envelope.parsed.message_id.clone())
+        .collect();
+    let mut seeds: HashMap<FamilyKey, String> = HashMap::new();
+    for envelope in envelopes.iter() {
+        let Some((version, _seq, total, title)) =
+            patch_worker::patch_series_signature(&envelope.parsed.subject)
+        else {
+            continue;
+        };
+        let family = (version, total, series_family_key(&title));
+        let is_reply = is_reply_or_forward_subject(&envelope.parsed.subject);
+        let needs_thread = if is_reply {
+            let references_known = envelope
+                .parsed
+                .references
+                .iter()
+                .chain(envelope.parsed.in_reply_to.iter())
+                .any(|reference| known_non_reply_ids.contains(reference));
+            !references_known
+                || !present_by_family
+                    .get(&family)
+                    .is_some_and(|sequences| sequences.len() >= total as usize)
+        } else {
+            incomplete_families.contains(&family)
+        };
+        if needs_thread {
+            seeds
+                .entry(family)
+                .or_insert_with(|| envelope.parsed.message_id.clone());
+        }
+    }
+
+    if seeds.is_empty() {
+        return Ok(());
+    }
+
+    let mut known: HashSet<String> = envelopes
+        .iter()
+        .map(|envelope| envelope.parsed.message_id.clone())
+        .collect();
+    for message_id in seeds.values() {
+        let fetched = match client.fetch_thread(mailbox, message_id) {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                tracing::warn!(
+                    mailbox = %mailbox,
+                    message_id = %message_id,
+                    error = %error,
+                    "failed to complete lore patch thread"
+                );
+                continue;
+            }
+        };
+        for remote in fetched {
+            let parsed =
+                mail_parser::parse_headers(&remote.raw, format!("uid-{}@criew", remote.uid));
+            if known.insert(parsed.message_id.clone()) {
+                envelopes.push(RemoteMailEnvelope { remote, parsed });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_reply_or_forward_subject(subject: &str) -> bool {
+    let value = subject.trim_start().to_ascii_lowercase();
+    value.starts_with("re:") || value.starts_with("fwd:") || value.starts_with("fw:")
+}
+
+fn series_family_key(title: &str) -> String {
+    title
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .find(|word| !word.is_empty())
+        .unwrap_or_default()
 }
 
 fn load_checkpoint(
@@ -501,7 +684,7 @@ fn fetch_messages(
         return client.fetch_full_uids(mailbox, &selection.selected_uids);
     }
 
-    if let SyncSource::Following { self_email } = source {
+    if let Some(self_email) = source.following_self_email() {
         return client.fetch_following_incremental(mailbox, self_email, after_uid, since_modseq);
     }
 
@@ -509,9 +692,13 @@ fn fetch_messages(
 }
 
 fn filter_messages(envelopes: &mut Vec<RemoteMailEnvelope>, source: &SyncSource, mailbox: &str) {
-    if let SyncSource::Following { self_email } = source {
+    if let Some(self_email) = source.following_self_email() {
         let before = envelopes.len();
-        envelopes.retain(|envelope| is_following_match(&envelope.parsed, self_email));
+        if source.is_following_sent() {
+            envelopes.retain(|envelope| is_following_sent_match(&envelope.parsed, self_email));
+        } else {
+            envelopes.retain(|envelope| is_following_match(&envelope.parsed, self_email));
+        }
         log_filter_result("following_filter", mailbox, envelopes.len(), before);
         return;
     }
@@ -571,9 +758,14 @@ fn persist_and_write(
         },
     )?;
 
-    if let SyncSource::Following { self_email } = source {
+    if let Some(self_email) = source.following_self_email() {
         mail_store::refresh_following_updates(&config.database_path, self_email)?;
     }
+
+    // Series resolution is a durable projection of all messages in the
+    // source, not a calculation performed from the currently visible TUI
+    // slice.  Refresh it after every ingest so later views can page safely.
+    series_store::refresh(&config.database_path, mailbox)?;
 
     Ok(write_result)
 }
@@ -707,8 +899,17 @@ fn is_following_match(parsed: &ParsedMailHeaders, self_email: &str) -> bool {
     let is_sent_patch = normalize_email_address(&parsed.from_addr)
         .is_some_and(|address| address == self_email)
         && is_sent_patch_subject(&parsed.subject);
+    let is_sent_reply = normalize_email_address(&parsed.from_addr)
+        .is_some_and(|address| address == self_email)
+        && is_reply_or_forward_subject(&parsed.subject)
+        && patch_worker::subject_is_patch_related(&parsed.subject);
 
-    matches_to || matches_cc || is_sent_patch
+    matches_to || matches_cc || is_sent_patch || is_sent_reply
+}
+
+fn is_following_sent_match(parsed: &ParsedMailHeaders, self_email: &str) -> bool {
+    normalize_email_address(&parsed.from_addr).is_some_and(|address| address == self_email)
+        && patch_worker::subject_is_patch_related(&parsed.subject)
 }
 
 fn is_sent_patch_subject(subject: &str) -> bool {
@@ -756,12 +957,6 @@ fn select_initial_inbox_messages(
         selected_threads,
         selected_uids,
     }
-}
-
-
-fn message_sort_rank(message: &RemoteMailEnvelope) -> u64 {
-    let modseq = message.remote.modseq.unwrap_or(0);
-    (modseq << 32) | message.remote.uid as u64
 }
 
 fn thread_root_key(
@@ -864,11 +1059,50 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::infra::db;
+    use crate::infra::error::Result;
+    use crate::infra::mail_parser;
     use crate::infra::mail_store;
 
-    use super::{SyncRequest, SyncSource, resolve_sync_source, run, select_initial_inbox_messages};
+    use super::{
+        RemoteMailEnvelope, SyncRequest, SyncSource, complete_incomplete_patch_series,
+        is_following_match, is_following_sent_match, resolve_sync_source, run,
+        select_initial_inbox_messages,
+    };
     use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
-    use crate::infra::imap::RemoteMail;
+    use crate::infra::imap::{ImapClient, MailboxSnapshot, RemoteMail};
+
+    struct ThreadFixtureClient {
+        thread: Vec<RemoteMail>,
+        requested_ids: Vec<String>,
+    }
+
+    impl ImapClient for ThreadFixtureClient {
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn select_mailbox(&mut self, _mailbox: &str) -> Result<MailboxSnapshot> {
+            Ok(MailboxSnapshot {
+                uidvalidity: 1,
+                highest_uid: 0,
+                highest_modseq: None,
+            })
+        }
+
+        fn fetch_incremental(
+            &mut self,
+            _mailbox: &str,
+            _after_uid: u32,
+            _since_modseq: Option<u64>,
+        ) -> Result<Vec<RemoteMail>> {
+            Ok(Vec::new())
+        }
+
+        fn fetch_thread(&mut self, _mailbox: &str, message_id: &str) -> Result<Vec<RemoteMail>> {
+            self.requested_ids.push(message_id.to_string());
+            Ok(self.thread.clone())
+        }
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -921,6 +1155,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees: Vec::new(),
         };
 
@@ -1041,6 +1276,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees: Vec::new(),
         };
 
@@ -1080,20 +1316,50 @@ mod tests {
         }
         db::initialize(&db_path).expect("initialize db");
         let runtime = RuntimeConfig {
-            config_path: root.join("config.toml"), data_dir: data_dir.clone(), database_path: db_path.clone(), raw_mail_dir: raw_dir,
-            patch_dir: data_dir.join("patches"), log_dir: data_dir.join("logs"), b4_path: None, log_filter: "info".to_string(), source_mailbox: "inbox".to_string(),
-            imap: crate::infra::config::ImapConfig::default(), lore_base_url: "https://lore.kernel.org".to_string(), startup_sync: true,
-            ui_keymap: crate::infra::config::UiKeymap::Default, ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
-            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(), inbox_auto_sync_interval_secs: crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS, kernel_trees: Vec::new(),
+            config_path: root.join("config.toml"),
+            data_dir: data_dir.clone(),
+            database_path: db_path.clone(),
+            raw_mail_dir: raw_dir,
+            patch_dir: data_dir.join("patches"),
+            log_dir: data_dir.join("logs"),
+            b4_path: None,
+            log_filter: "info".to_string(),
+            source_mailbox: "inbox".to_string(),
+            imap: crate::infra::config::ImapConfig::default(),
+            lore_base_url: "https://lore.kernel.org".to_string(),
+            startup_sync: true,
+            ui_keymap: crate::infra::config::UiKeymap::Default,
+            ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
+            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
+            inbox_auto_sync_interval_secs:
+                crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
+            kernel_trees: Vec::new(),
         };
-        let summary = run(&runtime, SyncRequest { mailbox: "inbox".to_string(), fixture_dir: Some(fixture_dir), uidvalidity: Some(1), reconnect_attempts: 1 }).expect("first sync");
+        let summary = run(
+            &runtime,
+            SyncRequest {
+                mailbox: "inbox".to_string(),
+                fixture_dir: Some(fixture_dir),
+                uidvalidity: Some(1),
+                reconnect_attempts: 1,
+            },
+        )
+        .expect("first sync");
         assert_eq!(summary.fetched, 25);
         assert_eq!(summary.inserted, 25);
         assert_eq!(summary.checkpoint_last_seen_uid, 25);
-        let rows = mail_store::load_thread_rows_by_mailbox(&db_path, "inbox", 100).expect("load thread rows");
+        let rows = mail_store::load_thread_rows_by_mailbox(&db_path, "inbox", 100)
+            .expect("load thread rows");
         assert_eq!(rows.len(), 25);
-        assert!(rows.iter().any(|row| row.message_id == "thread-1@example.com"));
-        assert!(rows.iter().any(|row| row.message_id == "thread-25@example.com"));
+        assert!(
+            rows.iter()
+                .any(|row| row.message_id == "thread-1@example.com")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.message_id == "thread-25@example.com")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1117,6 +1383,7 @@ mod tests {
                 server_port: Some(993),
                 encryption: Some(crate::infra::config::ImapEncryption::Tls),
                 proxy: None,
+                sent_mailbox: None,
             },
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
@@ -1125,6 +1392,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees: Vec::new(),
         };
 
@@ -1162,6 +1430,7 @@ mod tests {
                 server_port: Some(993),
                 encryption: Some(crate::infra::config::ImapEncryption::Tls),
                 proxy: None,
+                sent_mailbox: None,
             },
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
@@ -1170,6 +1439,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees: Vec::new(),
         };
 
@@ -1207,6 +1477,7 @@ mod tests {
                 server_port: Some(993),
                 encryption: Some(crate::infra::config::ImapEncryption::Tls),
                 proxy: None,
+                sent_mailbox: None,
             },
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
@@ -1215,6 +1486,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees: Vec::new(),
         };
 
@@ -1252,6 +1524,7 @@ mod tests {
                 server_port: Some(993),
                 encryption: Some(crate::infra::config::ImapEncryption::Tls),
                 proxy: None,
+                sent_mailbox: None,
             },
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
@@ -1260,6 +1533,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
 
             kernel_trees: Vec::new(),
         };
@@ -1296,5 +1570,100 @@ mod tests {
         ];
         let selection = select_initial_inbox_messages("list", messages);
         assert_eq!(selection.selected_uids, vec![1, 2]);
+    }
+
+    #[test]
+    fn following_keeps_own_reply_mail() {
+        let parsed = mail_parser::parse_headers(
+            b"Message-ID: <reply@example.com>\nSubject: Re: [PATCH 1/1] demo\nFrom: Me <me@example.com>\nTo: list@example.com\n\nreply\n",
+            "fallback@example.com".to_string(),
+        );
+        assert!(is_following_match(&parsed, "me@example.com"));
+    }
+
+    #[test]
+    fn sent_mail_sync_keeps_only_own_patch_messages() {
+        let own_patch = mail_parser::parse_headers(
+            b"Message-ID: <patch@example.com>\nSubject: Re: [PATCH 1/1] demo\nFrom: me@example.com\n\nreply\n",
+            "patch-fallback@example.com".to_string(),
+        );
+        let own_regular = mail_parser::parse_headers(
+            b"Message-ID: <note@example.com>\nSubject: status update\nFrom: me@example.com\n\nnote\n",
+            "note-fallback@example.com".to_string(),
+        );
+        let someone_else_patch = mail_parser::parse_headers(
+            b"Message-ID: <other@example.com>\nSubject: [PATCH 1/1] demo\nFrom: other@example.com\n\npatch\n",
+            "other-fallback@example.com".to_string(),
+        );
+
+        assert!(is_following_sent_match(&own_patch, "me@example.com"));
+        assert!(!is_following_sent_match(&own_regular, "me@example.com"));
+        assert!(!is_following_sent_match(
+            &someone_else_patch,
+            "me@example.com"
+        ));
+    }
+
+    #[test]
+    fn lore_sync_completes_reply_only_patch_series_from_thread_endpoint() {
+        let reply_raw = b"Message-ID: <reply@example.com>\nSubject: Re: [PATCH v3 2/2] demo\nIn-Reply-To: <cover@example.com>\nReferences: <cover@example.com>\n\nreply\n".to_vec();
+        let thread = vec![
+            RemoteMail {
+                uid: 0,
+                modseq: None,
+                flags: Vec::new(),
+                raw: b"Message-ID: <cover@example.com>\nSubject: [PATCH v3 0/2] demo\n\ncover\n".to_vec(),
+            },
+            RemoteMail {
+                uid: 0,
+                modseq: None,
+                flags: Vec::new(),
+                raw: b"Message-ID: <patch-1@example.com>\nSubject: [PATCH v3 1/2] demo\nIn-Reply-To: <cover@example.com>\nReferences: <cover@example.com>\n\npatch 1\n".to_vec(),
+            },
+            RemoteMail {
+                uid: 0,
+                modseq: None,
+                flags: Vec::new(),
+                raw: b"Message-ID: <patch-2@example.com>\nSubject: [PATCH v3 2/2] demo\nIn-Reply-To: <cover@example.com>\nReferences: <cover@example.com>\n\npatch 2\n".to_vec(),
+            },
+            RemoteMail {
+                uid: 0,
+                modseq: None,
+                flags: Vec::new(),
+                raw: reply_raw.clone(),
+            },
+        ];
+        let parsed = mail_parser::parse_headers(&reply_raw, "fallback@example.com".to_string());
+        let mut envelopes = vec![RemoteMailEnvelope {
+            remote: RemoteMail {
+                uid: 0,
+                modseq: None,
+                flags: Vec::new(),
+                raw: reply_raw,
+            },
+            parsed,
+        }];
+        let mut client = ThreadFixtureClient {
+            thread,
+            requested_ids: Vec::new(),
+        };
+
+        complete_incomplete_patch_series(
+            &mut client,
+            "io-uring",
+            &mut envelopes,
+            &SyncSource::Lore {
+                base_url: "https://lore.test".to_string(),
+            },
+        )
+        .expect("complete lore patch thread");
+
+        assert_eq!(client.requested_ids, vec!["reply@example.com"]);
+        assert_eq!(envelopes.len(), 4);
+        assert!(
+            envelopes
+                .iter()
+                .any(|envelope| envelope.parsed.message_id == "cover@example.com")
+        );
     }
 }

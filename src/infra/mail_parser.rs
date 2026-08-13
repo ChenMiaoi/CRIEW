@@ -17,6 +17,7 @@ pub struct ParsedMailHeaders {
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     pub list_id: Option<String>,
+    pub change_id: Option<String>,
     pub trailers: Vec<ParsedTrailer>,
 }
 
@@ -69,6 +70,11 @@ pub fn parse_headers(raw: &[u8], fallback_message_id: String) -> ParsedMailHeade
         in_reply_to,
         references,
         list_id: header_value(&headers, "list-id").filter(|value| !value.is_empty()),
+        change_id: header_value(&headers, "change-id")
+            .or_else(|| header_value(&headers, "x-change-id"))
+            .or_else(|| header_value(&headers, "x-series-change-id"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         trailers: parse_review_trailers(raw),
     }
 }
@@ -358,7 +364,7 @@ mod tests {
 
     #[test]
     fn parses_basic_headers_and_reference_chain() {
-        let raw = b"Message-ID: <root@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nCc: List <list@example.com>\r\nReferences: <a@example.com> <b@example.com>\r\nIn-Reply-To: <b@example.com>\r\n\r\nbody\r\n";
+        let raw = b"Message-ID: <root@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nCc: List <list@example.com>\r\nReferences: <a@example.com> <b@example.com>\r\nIn-Reply-To: <b@example.com>\r\nX-Series-Change-ID: demo-series\r\n\r\nbody\r\n";
 
         let parsed = parse_headers(raw, "fallback@example.com".to_string());
         assert_eq!(parsed.message_id, "root@example.com");
@@ -366,6 +372,7 @@ mod tests {
         assert_eq!(parsed.cc_addresses, vec!["list@example.com"]);
         assert_eq!(parsed.in_reply_to.as_deref(), Some("b@example.com"));
         assert_eq!(parsed.references, vec!["a@example.com", "b@example.com"]);
+        assert_eq!(parsed.change_id.as_deref(), Some("demo-series"));
     }
 
     #[test]

@@ -41,6 +41,9 @@ criew tui
 它包含发给你的邮件（`To`）、抄送给你的邮件（`Cc`）以及你发送的 patch（`From`），
 并显示 `TO`、`CC`、`SENT` 标记。CRIEW 实际检索并同步 IMAP `INBOX`，但 `INBOX`
 只是内部数据源，不会作为第二个可见订阅出现。
+如果邮件服务商把已发送邮件只放在独立文件夹中，可在 `[imap]` 设置
+`sent_mailbox = "Sent"`（Gmail 通常是 `[Gmail]/Sent Mail`）；Following 会用独立
+checkpoint 增量导入你自己发送的 patch/reply。
 
 如果增量同步只拿到了一部分对话，可以对其中任意一封邮件的
 `Message-ID` 运行 `fetch-thread`。命令会沿着 `References`/`In-Reply-To`

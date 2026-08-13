@@ -33,6 +33,7 @@ use crate::infra::reply_store::{
     self, ReplyDraft, ReplyDraftRequest, ReplyDraftStatus, ReplySendRecordRequest, ReplySendStatus,
 };
 use crate::infra::sendmail::{self, SendOutcome, SendRequest, SendStatus};
+use crate::infra::series_store::{self, SeriesCatalog};
 use crate::infra::ui_state::{self, SavedView, UiState};
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -1415,6 +1416,8 @@ struct AppState {
     self_email: Option<String>,
     following_kinds: HashMap<i64, Vec<FollowingKind>>,
     series_summaries: HashMap<i64, patch_worker::SeriesSummary>,
+    series_catalog: Vec<SeriesCatalog>,
+    expanded_thread_ids: HashSet<i64>,
     review_summaries: HashMap<i64, review_worker::ReviewInboxEntry>,
     review_inbox_mode: Option<ReviewInboxMode>,
     filtered_thread_indices: Vec<usize>,
@@ -1473,7 +1476,11 @@ impl AppState {
         persisted: Option<UiState>,
     ) -> Self {
         let ui_state_path = ui_state::path_for_data_dir(&runtime.data_dir);
-        let mail_pane_layout = MailPaneLayout::from_persisted(persisted.as_ref());
+        let preview_resize_allowed = preview_resize_allowed(&runtime);
+        let mut mail_pane_layout = MailPaneLayout::from_persisted(persisted.as_ref());
+        if !preview_resize_allowed {
+            mail_pane_layout.preview_width = ui_state::DEFAULT_MAIL_PREVIEW_WIDTH;
+        }
         let persisted_imap_defaults_initialized = persisted
             .as_ref()
             .map(|state| state.imap_defaults_initialized)
@@ -1552,6 +1559,8 @@ impl AppState {
             self_email,
             following_kinds: HashMap::new(),
             series_summaries: HashMap::new(),
+            series_catalog: Vec::new(),
+            expanded_thread_ids: HashSet::new(),
             review_summaries: HashMap::new(),
             review_inbox_mode: None,
             filtered_thread_indices: Vec::new(),
@@ -1644,7 +1653,24 @@ impl AppState {
                     .review_summaries
                     .get(&row.thread_id)
                     .map(|summary| summary.status_label());
-                if review_matches && query.matches(row, review_status) {
+                let patch_thread = self.series_summaries.contains_key(&row.thread_id)
+                    || self.catalog_for_thread(row.thread_id).is_some();
+                let is_reply = row
+                    .subject
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("re:")
+                    || row
+                        .subject
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("fwd:");
+                let collapsed_reply = query.is_empty()
+                    && patch_thread
+                    && is_reply
+                    && !is_following_view(&self.active_thread_mailbox)
+                    && !self.expanded_thread_ids.contains(&row.thread_id);
+                if review_matches && query.matches(row, review_status) && !collapsed_reply {
                     Some(index)
                 } else {
                     None
@@ -1760,7 +1786,7 @@ impl AppState {
         }
 
         for mailbox in unique_candidates {
-            match self.load_thread_rows_for_view(&mailbox, 500) {
+            match self.load_thread_rows_for_view(&mailbox, 0) {
                 Ok(rows) if !rows.is_empty() => {
                     self.show_mailbox_threads(
                         &mailbox,
@@ -1951,6 +1977,23 @@ impl AppState {
     fn refresh_series_summaries(&mut self) {
         self.series_summaries =
             patch_worker::build_series_index(&self.active_thread_mailbox, &self.threads);
+        let source_key = self
+            .threads
+            .iter()
+            .find_map(|row| (!row.mailbox.trim().is_empty()).then_some(row.mailbox.as_str()))
+            .unwrap_or(self.active_thread_mailbox.as_str())
+            .to_string();
+        if let Err(error) = series_store::refresh(&self.runtime.database_path, &source_key) {
+            tracing::debug!(source = %source_key, error = %error, "series catalog refresh is not available yet");
+        }
+        self.series_catalog = series_store::load_catalog(
+            &self.runtime.database_path,
+            &source_key,
+        )
+        .unwrap_or_else(|error| {
+            tracing::debug!(source = %source_key, error = %error, "series catalog is not available yet");
+            Vec::new()
+        });
         if let Err(error) = patch_worker::hydrate_series_statuses(
             &self.runtime.database_path,
             &self.active_thread_mailbox,
@@ -1987,11 +2030,23 @@ impl AppState {
     fn load_thread_rows_for_view(&self, mailbox: &str, limit: usize) -> Result<Vec<ThreadRow>> {
         if is_following_view(mailbox) {
             let Some(self_email) = self.self_email.as_deref() else {
-                return Ok(Vec::new());
+                return mail_store::load_thread_rows_by_mailbox(
+                    &self.runtime.database_path,
+                    mailbox,
+                    limit,
+                );
             };
-            return mail_store::load_following_thread_rows(
+            let following_rows = mail_store::load_following_thread_rows(
                 &self.runtime.database_path,
                 self_email,
+                limit,
+            )?;
+            if !following_rows.is_empty() || mailbox.eq_ignore_ascii_case(FOLLOWING_VIEW) {
+                return Ok(following_rows);
+            }
+            return mail_store::load_thread_rows_by_mailbox(
+                &self.runtime.database_path,
+                mailbox,
                 limit,
             );
         }
@@ -3183,7 +3238,7 @@ impl AppState {
     }
 
     fn reload_mailbox_threads_preserving_selection(&mut self, mailbox: &str) -> Result<()> {
-        let rows = self.load_thread_rows_for_view(mailbox, 500)?;
+        let rows = self.load_thread_rows_for_view(mailbox, 0)?;
         if same_mailbox_name(mailbox, &self.active_thread_mailbox) {
             self.replace_threads_preserving_selection(rows);
         }
@@ -3518,7 +3573,7 @@ impl AppState {
             return;
         }
 
-        match self.load_thread_rows_for_view(&mailbox, 500) {
+        match self.load_thread_rows_for_view(&mailbox, 0) {
             Ok(rows) if !rows.is_empty() => {
                 self.show_mailbox_threads(
                     &mailbox,
@@ -3582,6 +3637,68 @@ impl AppState {
     fn selected_series(&self) -> Option<&patch_worker::SeriesSummary> {
         let thread = self.selected_thread()?;
         self.series_summaries.get(&thread.thread_id)
+    }
+
+    pub(super) fn has_selected_patch_series(&self) -> bool {
+        let Some(thread) = self.selected_thread() else {
+            return false;
+        };
+        self.series_summaries.contains_key(&thread.thread_id)
+            || self.catalog_for_thread(thread.thread_id).is_some()
+    }
+
+    fn toggle_selected_thread_expansion(&mut self) {
+        if is_following_view(&self.active_thread_mailbox) {
+            self.status =
+                "My Mail keeps replies visible; use search to narrow the list".to_string();
+            return;
+        }
+        let Some(thread_id) = self.selected_thread().map(|row| row.thread_id) else {
+            self.status = "select a conversation first".to_string();
+            return;
+        };
+        let expanded = if self.expanded_thread_ids.remove(&thread_id) {
+            false
+        } else {
+            self.expanded_thread_ids.insert(thread_id);
+            true
+        };
+        let selected_message_id = self.selected_thread().map(|row| row.message_id.clone());
+        self.apply_thread_filter();
+        if let Some(message_id) = selected_message_id
+            && let Some(index) = self.filtered_thread_indices.iter().position(|row_index| {
+                self.threads
+                    .get(*row_index)
+                    .is_some_and(|row| row.message_id == message_id)
+            })
+        {
+            self.thread_index = index;
+            self.refresh_selected_mail_preview();
+        }
+        self.status = if expanded {
+            "conversation expanded (x to collapse)".to_string()
+        } else {
+            "conversation collapsed (x to expand)".to_string()
+        };
+    }
+
+    pub(super) fn catalog_for_thread(&self, thread_id: i64) -> Option<&SeriesCatalog> {
+        self.series_catalog.iter().find(|catalog| {
+            catalog.thread_id == Some(thread_id)
+                || catalog.members.iter().any(|member| {
+                    self.threads
+                        .iter()
+                        .any(|row| row.thread_id == thread_id && row.mail_id == member.mail_id)
+                })
+        })
+    }
+
+    pub(super) fn visible_thread_count(&self) -> usize {
+        self.filtered_thread_indices
+            .iter()
+            .filter_map(|index| self.threads.get(*index).map(|row| row.thread_id))
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     fn open_reply_panel(&mut self, require_preview_focus: bool) {
@@ -4503,6 +4620,17 @@ impl AppState {
         direction: HorizontalResizeDirection,
         resize_mode: MailPaneResizeMode,
     ) {
+        let preview_is_target = matches!(
+            (self.focus, direction),
+            (Pane::Threads, HorizontalResizeDirection::Right)
+                | (Pane::Preview, HorizontalResizeDirection::Left)
+                | (Pane::Preview, HorizontalResizeDirection::Right)
+        );
+        if preview_is_target && !preview_resize_allowed(&self.runtime) {
+            self.status = "preview pane resizing is disabled (set ui.allow_preview_resize = true)"
+                .to_string();
+            return;
+        }
         let did_resize = match (self.focus, direction, resize_mode) {
             (Pane::Subscriptions, HorizontalResizeDirection::Left, _) => false,
             (Pane::Subscriptions, HorizontalResizeDirection::Right, MailPaneResizeMode::Expand) => {
@@ -4598,6 +4726,52 @@ impl AppState {
         }
 
         self.select_filtered_thread_at(self.thread_index + 1);
+    }
+
+    fn select_patch_member(&mut self, next: bool) {
+        let Some(current_mail_id) = self.selected_thread().map(|row| row.mail_id) else {
+            return;
+        };
+        let Some(thread_id) = self.selected_thread().map(|row| row.thread_id) else {
+            return;
+        };
+        let members: Vec<i64> = if let Some(series) = self.series_summaries.get(&thread_id) {
+            let mut members: Vec<i64> = series.items.iter().map(|item| item.mail_id).collect();
+            members.sort_unstable();
+            members
+        } else if let Some(catalog) = self.catalog_for_thread(thread_id) {
+            catalog
+                .members
+                .iter()
+                .map(|member| member.mail_id)
+                .collect()
+        } else {
+            self.status = "selected conversation is not a patch series".to_string();
+            return;
+        };
+        let current = members
+            .iter()
+            .position(|mail_id| *mail_id == current_mail_id)
+            .unwrap_or(0);
+        let target = if next {
+            (current + 1).min(members.len().saturating_sub(1))
+        } else {
+            current.saturating_sub(1)
+        };
+        let Some(target_mail_id) = members.get(target).copied() else {
+            return;
+        };
+        if let Some(index) = self.filtered_thread_indices.iter().position(|row_index| {
+            self.threads
+                .get(*row_index)
+                .is_some_and(|row| row.mail_id == target_mail_id)
+        }) {
+            self.select_filtered_thread_at(index);
+            self.status = format!("patch member {}/{}", target + 1, members.len());
+        } else {
+            self.status =
+                "patch member is not loaded; press F to fetch the complete thread".to_string();
+        }
     }
 
     fn move_up(&mut self) {
@@ -5802,20 +5976,41 @@ fn persist_reply_send_result(
         },
     )?;
 
-    if matches!(outcome.status, SendStatus::Sent) && is_outgoing_patch_subject(&request.subject) {
-        mail_store::record_following_sent_patch(
-            &runtime.database_path,
-            &mail_store::FollowingSentPatch {
-                mail_id: request.mail_id,
-                thread_id: request.thread_id,
-                message_id: outcome.message_id.clone(),
-                from_addr: request.from.clone(),
-                to_addrs: request.to.clone(),
-                cc_addrs: request.cc.clone(),
-                subject: request.subject.clone(),
-                occurred_at: outcome.finished_at.clone(),
-            },
-        )?;
+    if matches!(outcome.status, SendStatus::Sent) {
+        let raw_path = archive_sent_reply(runtime, request, &outcome.message_id);
+        if is_outgoing_patch_subject(&request.subject) {
+            mail_store::record_following_sent_patch(
+                &runtime.database_path,
+                &mail_store::FollowingSentPatch {
+                    mail_id: request.mail_id,
+                    thread_id: request.thread_id,
+                    message_id: outcome.message_id.clone(),
+                    from_addr: request.from.clone(),
+                    to_addrs: request.to.clone(),
+                    cc_addrs: request.cc.clone(),
+                    subject: request.subject.clone(),
+                    occurred_at: outcome.finished_at.clone(),
+                },
+            )?;
+        } else if is_reply_or_forward_subject(&request.subject)
+            && patch_worker::subject_is_patch_related(&request.subject)
+        {
+            mail_store::record_following_sent_reply(
+                &runtime.database_path,
+                &mail_store::FollowingSentReply {
+                    parent_mail_id: request.mail_id,
+                    thread_id: request.thread_id,
+                    message_id: outcome.message_id.clone(),
+                    from_addr: request.from.clone(),
+                    to_addrs: request.to.clone(),
+                    cc_addrs: request.cc.clone(),
+                    subject: request.subject.clone(),
+                    in_reply_to: non_empty_reply_header(&request.in_reply_to),
+                    raw_path,
+                    occurred_at: outcome.finished_at.clone(),
+                },
+            )?;
+        }
     }
 
     Ok(record_id)
@@ -5826,6 +6021,48 @@ fn is_outgoing_patch_subject(subject: &str) -> bool {
     !normalized.starts_with("re:")
         && !normalized.starts_with("fwd:")
         && patch_worker::subject_is_patch_related(subject)
+}
+
+fn is_reply_or_forward_subject(subject: &str) -> bool {
+    let normalized = subject.trim().to_ascii_lowercase();
+    normalized.starts_with("re:") || normalized.starts_with("fwd:") || normalized.starts_with("fw:")
+}
+
+fn non_empty_reply_header(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches(['<', '>']);
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn archive_sent_reply(
+    runtime: &RuntimeConfig,
+    request: &SendRequest,
+    message_id: &str,
+) -> Option<PathBuf> {
+    let directory = runtime.data_dir.join("mail").join("sent");
+    if let Err(error) = fs::create_dir_all(&directory) {
+        tracing::warn!(error = %error, "failed to create sent reply archive directory");
+        return None;
+    }
+    let file_name = format!(
+        "{}.eml",
+        message_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '@') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    );
+    let path = directory.join(file_name);
+    let content = sendmail::render_message_file(request, message_id);
+    if let Err(error) = fs::write(&path, content) {
+        tracing::warn!(path = %path.display(), error = %error, "failed to archive sent reply");
+        return None;
+    }
+    Some(path)
 }
 
 fn now_timestamp() -> String {
@@ -5890,7 +6127,7 @@ pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiActi
         .filter(|mailbox| !mailbox.is_empty())
         .map(canonical_view_mailbox)
         .unwrap_or_else(|| config.default_active_mailbox().to_string());
-    let threads = load_thread_rows_for_runtime(config, &initial_mailbox, 500)?;
+    let threads = load_thread_rows_for_runtime(config, &initial_mailbox, 0)?;
     let mut terminal = setup_terminal()?;
     let guard = TerminalGuard;
     let mut state = if let Some(persisted) = persisted_ui_state {
@@ -5937,9 +6174,13 @@ fn load_thread_rows_for_runtime(
 ) -> Result<Vec<ThreadRow>> {
     if is_following_view(mailbox) {
         let Some(self_email) = crate::infra::config::resolve_self_email(config).email else {
-            return Ok(Vec::new());
+            return mail_store::load_thread_rows_by_mailbox(&config.database_path, mailbox, limit);
         };
-        return mail_store::load_following_thread_rows(&config.database_path, &self_email, limit);
+        let following_rows =
+            mail_store::load_following_thread_rows(&config.database_path, &self_email, limit)?;
+        if !following_rows.is_empty() || mailbox.eq_ignore_ascii_case(FOLLOWING_VIEW) {
+            return Ok(following_rows);
+        }
     }
 
     mail_store::load_thread_rows_by_mailbox(&config.database_path, mailbox, limit)
@@ -6292,6 +6533,24 @@ fn same_mailbox_name(left: &str, right: &str) -> bool {
 
 fn is_following_view(mailbox: &str) -> bool {
     mailbox.eq_ignore_ascii_case(FOLLOWING_VIEW) || mailbox.trim() == IMAP_INBOX_MAILBOX
+}
+
+fn preview_resize_allowed(runtime: &RuntimeConfig) -> bool {
+    if runtime.allow_preview_resize {
+        return true;
+    }
+    let Ok(content) = fs::read_to_string(&runtime.config_path) else {
+        return false;
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+        return false;
+    };
+    table
+        .get("ui")
+        .and_then(toml::Value::as_table)
+        .and_then(|ui| ui.get("allow_preview_resize"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn canonical_view_mailbox(mailbox: &str) -> String {

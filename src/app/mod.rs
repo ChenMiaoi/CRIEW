@@ -571,6 +571,7 @@ mod tests {
             ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs: DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees: Vec::new(),
         }
     }
@@ -701,6 +702,7 @@ mod tests {
             server_port: Some(993),
             encryption: Some(ImapEncryption::Tls),
             proxy: None,
+            sent_mailbox: None,
         };
         let self_email = SelfEmailResolution {
             email: Some("me@example.com".to_string()),
@@ -769,6 +771,7 @@ mod tests {
             server_port: Some(993),
             encryption: Some(ImapEncryption::Tls),
             proxy: None,
+            sent_mailbox: None,
         };
 
         let report = format_doctor_report(

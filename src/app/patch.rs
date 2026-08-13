@@ -296,6 +296,7 @@ pub fn hydrate_series_statuses(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn load_latest_report(
     database_path: &Path,
     mailbox: &str,
@@ -1096,7 +1097,6 @@ pub(crate) fn patch_series_signature(subject: &str) -> Option<(u32, u32, u32, St
     })
 }
 
-
 fn parse_patch_subject(subject: &str) -> Option<ParsedPatchSubject> {
     parse_patch_subject_with_reply_mode(subject, false)
 }
@@ -1634,6 +1634,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees,
         }
     }
@@ -1657,6 +1658,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees,
         }
     }
@@ -1692,6 +1694,7 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    #[cfg(unix)]
     fn write_script(root: &Path, name: &str, body: &str) -> PathBuf {
         let path = root.join(name);
         fs::write(&path, body).expect("write script");
@@ -2158,7 +2161,6 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
             Some("no valid [PATCH vN M/N] sequence found")
         );
     }
-
 
     #[test]
     fn apply_requires_kernel_tree_configuration() {

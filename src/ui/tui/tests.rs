@@ -167,6 +167,7 @@ fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
         ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
         ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
         inbox_auto_sync_interval_secs: crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+        allow_preview_resize: false,
         kernel_trees: Vec::new(),
     }
 }
@@ -203,6 +204,7 @@ fn test_runtime_with_imap_in(root: PathBuf) -> RuntimeConfig {
         server_port: Some(993),
         encryption: Some(crate::infra::config::ImapEncryption::Tls),
         proxy: None,
+        sent_mailbox: None,
     };
     runtime
 }
@@ -5286,6 +5288,21 @@ fn reply_send_preview_requires_confirmation_before_send() {
     assert_eq!(record.message_id, "sent@example.com");
     assert_eq!(record.subject, "Re: [PATCH] demo");
 
+    let following_rows =
+        mail_store::load_following_thread_rows(&runtime.database_path, "criew@example.com", 0)
+            .expect("load sent reply in My Mail");
+    let sent_reply = following_rows
+        .iter()
+        .find(|row| row.message_id == "sent@example.com")
+        .expect("sent reply should be visible in My Mail");
+    assert_eq!(sent_reply.subject, "Re: [PATCH] demo");
+    assert!(
+        sent_reply
+            .raw_path
+            .as_ref()
+            .is_some_and(|path| path.exists())
+    );
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -6774,6 +6791,22 @@ fn threads_panel_renders_thread_group_headers() {
     assert!(rendered.contains("Thread 200 (1 msg)"));
     assert!(rendered.contains("thread a root"));
     assert!(rendered.contains("thread b root"));
+}
+
+#[test]
+fn my_mail_keeps_patch_replies_visible_without_manual_expand() {
+    let runtime = test_runtime_with_imap();
+    let rows = vec![
+        sample_thread_in_thread(100, 1, "[PATCH 0/1] demo", "root@example.com", 0),
+        sample_thread_in_thread(100, 2, "Re: [PATCH 0/1] demo", "reply@example.com", 1),
+    ];
+    let mut state = AppState::new(rows, runtime);
+    assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    assert_eq!(state.filtered_thread_indices.len(), 2);
+
+    state.active_thread_mailbox = "linux-kernel".to_string();
+    state.apply_thread_filter();
+    assert_eq!(state.filtered_thread_indices.len(), 1);
 }
 
 #[test]

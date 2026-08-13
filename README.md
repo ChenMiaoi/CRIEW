@@ -42,9 +42,13 @@ criew tui
 
 When IMAP is configured, the TUI exposes a virtual `My Mail` view instead of
 requiring a separate personal inbox subscription. It contains messages sent
-to you (`To`), copied to you (`Cc`), and patches sent by you (`From`), marked
-with `TO`, `CC`, and `SENT` badges. CRIEW searches and syncs the IMAP `INBOX`
-as an internal source; `INBOX` is not shown as a second user-facing view.
+to you (`To`), copied to you (`Cc`), and patches/replies sent by you (`From`),
+marked with `TO`, `CC`, and `SENT` badges. CRIEW searches and syncs the IMAP
+`INBOX` as an internal source; mailing-list patches authored by you are also
+folded into the same projection after their source mailbox is synced.
+If your provider stores sent mail only in a separate folder, set
+`[imap].sent_mailbox` (for example `Sent` or `[Gmail]/Sent Mail`) so Following
+can import your own patch/reply messages from that folder incrementally.
 
 When an incremental sync only captured part of a conversation, run
 `fetch-thread` with any Message-ID from that conversation. The command follows

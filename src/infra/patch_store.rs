@@ -368,6 +368,7 @@ LIMIT 1
     Ok(statuses)
 }
 
+#[allow(dead_code)]
 pub fn load_latest_report(
     path: &Path,
     mailbox: &str,

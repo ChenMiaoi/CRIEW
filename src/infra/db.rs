@@ -11,7 +11,7 @@ use rusqlite::{Connection, params};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::sqlite;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 const CREATE_SCHEMA_VERSION_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -67,6 +67,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         description: "following view recipient and update storage",
         sql: include_str!("../../migrations/0008_following_view.sql"),
+    },
+    Migration {
+        version: 9,
+        description: "canonical message sources, stable threads, and patch revisions",
+        sql: include_str!("../../migrations/0009_canonical_identity.sql"),
+    },
+    Migration {
+        version: 10,
+        description: "mail change-id metadata",
+        sql: include_str!("../../migrations/0010_change_id.sql"),
     },
 ];
 

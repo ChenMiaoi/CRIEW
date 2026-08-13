@@ -295,8 +295,22 @@ mod tests {
     #[test]
     fn patch_filter_matches_patch_replies_and_versioned_series() {
         let query = parse_query("is:patch").expect("query");
-        assert!(query.matches(&row("Re: [PATCH v6 4/20] mm: fix", "Bob", "reply@example.com", None), None));
-        assert!(query.matches(&row("fwd: [PATCH 1/1] docs: fix", "Bob", "fwd@example.com", None), None));
-        assert!(!query.matches(&row("Re: status update", "Bob", "status@example.com", None), None));
+        assert!(query.matches(
+            &row(
+                "Re: [PATCH v6 4/20] mm: fix",
+                "Bob",
+                "reply@example.com",
+                None
+            ),
+            None
+        ));
+        assert!(query.matches(
+            &row("fwd: [PATCH 1/1] docs: fix", "Bob", "fwd@example.com", None),
+            None
+        ));
+        assert!(!query.matches(
+            &row("Re: status update", "Bob", "status@example.com", None),
+            None
+        ));
     }
 }

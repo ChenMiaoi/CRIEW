@@ -106,6 +106,7 @@ mod tests {
             ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs: DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees: Vec::new(),
         }
     }

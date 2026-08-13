@@ -249,7 +249,7 @@ fn send_with_options(
     let args = build_send_email_args(request, &draft_path);
     let command_line = render_command_line(&resolved.display_name, &args);
 
-    let mut command = Command::new(&resolved.command);
+    let mut command = command_for_program(resolved.command.as_ref());
     command.args(&args);
     command
         .current_dir(resolve_working_dir(runtime))
@@ -502,7 +502,9 @@ fn run_probe<T>(command: T, args: &[&str], display_path: &Path, command_text: St
 where
     T: AsRef<std::ffi::OsStr>,
 {
-    match output_with_retry(Command::new(command).args(args)) {
+    let mut process = command_for_program(command.as_ref());
+    process.args(args);
+    match output_with_retry(&mut process) {
         Ok(output) if output.status.success() => Probe::Available {
             path: display_path.to_path_buf(),
             version: normalize_output(&output.stdout)
@@ -528,7 +530,9 @@ fn run_send_email_probe<T>(command: T, display_path: &Path, command_text: String
 where
     T: AsRef<std::ffi::OsStr> + Copy,
 {
-    match output_with_retry(Command::new(command).args(["send-email", "-h"])) {
+    let mut process = command_for_program(command.as_ref());
+    process.args(["send-email", "-h"]);
+    match output_with_retry(&mut process) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -573,7 +577,9 @@ fn probe_git_version<T>(command: T) -> Option<String>
 where
     T: AsRef<std::ffi::OsStr>,
 {
-    let output = output_with_retry(Command::new(command).arg("--version")).ok()?;
+    let mut process = command_for_program(command.as_ref());
+    process.arg("--version");
+    let output = output_with_retry(&mut process).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -641,7 +647,9 @@ fn resolve_git_binary(
 }
 
 fn git_config_value(command: &str, args: &[&str]) -> std::result::Result<Option<String>, String> {
-    let output = output_with_retry(Command::new(command).args(args))
+    let mut process = command_for_program(command.as_ref());
+    process.args(args);
+    let output = output_with_retry(&mut process)
         .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))?;
 
     if !output.status.success() {
@@ -658,6 +666,27 @@ fn git_config_value(command: &str, args: &[&str]) -> std::result::Result<Option<
     } else {
         Ok(Some(value))
     }
+}
+
+/// Run discovered Unix helper scripts through a POSIX shell on Windows.  Git
+/// for Windows (or MSYS) normally provides `sh`; native executables continue
+/// to be launched directly.
+fn command_for_program(program: &std::ffi::OsStr) -> Command {
+    #[cfg(windows)]
+    {
+        let path = Path::new(program);
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sh"))
+        {
+            let mut command = Command::new("sh");
+            command.arg(program);
+            return command;
+        }
+    }
+
+    Command::new(program)
 }
 
 fn output_with_retry(command: &mut Command) -> std::io::Result<std::process::Output> {
@@ -718,7 +747,7 @@ fn normalize_message_id(value: &str) -> String {
         .to_string()
 }
 
-fn render_message_file(request: &SendRequest, message_id: &str) -> String {
+pub(crate) fn render_message_file(request: &SendRequest, message_id: &str) -> String {
     // Emit a complete RFC822-style draft so `git send-email` handles transport
     // and SMTP concerns while CRIEW keeps ownership of message content.
     let mut lines = vec![
@@ -832,7 +861,7 @@ fn render_shell_token(token: &str) -> String {
     }
     if token
         .chars()
-        .all(|character| character.is_ascii_alphanumeric() || "_-./:@".contains(character))
+        .all(|character| character.is_ascii_alphanumeric() || "_-./\\:@".contains(character))
     {
         return token.to_string();
     }
@@ -915,7 +944,27 @@ mod tests {
     }
 
     fn canonicalize_existing_path(path: &Path) -> PathBuf {
-        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        let path = normalize_shell_path(path);
+        fs::canonicalize(&path).unwrap_or(path)
+    }
+
+    #[cfg(windows)]
+    fn normalize_shell_path(path: &Path) -> PathBuf {
+        let text = path.to_string_lossy();
+        if let Some(relative) = text.strip_prefix("/tmp/") {
+            return std::env::temp_dir().join(relative);
+        }
+        if text.len() >= 3 && text.starts_with('/') && text.as_bytes()[2] == b'/' {
+            let drive = text.as_bytes()[1] as char;
+            let relative = text[3..].replace('/', "\\");
+            return PathBuf::from(format!("{}:\\{relative}", drive.to_ascii_uppercase()));
+        }
+        path.to_path_buf()
+    }
+
+    #[cfg(not(windows))]
+    fn normalize_shell_path(path: &Path) -> PathBuf {
+        path.to_path_buf()
     }
 
     fn test_runtime_in(root: &Path) -> RuntimeConfig {
@@ -937,6 +986,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            allow_preview_resize: false,
             kernel_trees: Vec::new(),
         }
     }

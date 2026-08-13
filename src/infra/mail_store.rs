@@ -85,6 +85,20 @@ pub struct FollowingSentPatch {
 }
 
 #[derive(Debug, Clone)]
+pub struct FollowingSentReply {
+    pub parent_mail_id: i64,
+    pub thread_id: i64,
+    pub message_id: String,
+    pub from_addr: String,
+    pub to_addrs: Vec<String>,
+    pub cc_addrs: Vec<String>,
+    pub subject: String,
+    pub in_reply_to: Option<String>,
+    pub raw_path: Option<PathBuf>,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone)]
 struct MailGraphNode {
     id: i64,
     message_id: String,
@@ -139,7 +153,13 @@ pub fn mailbox_message_count(path: &Path, mailbox: &str) -> Result<usize> {
     let connection = open_connection(path)?;
     let count = connection
         .query_row(
-            "SELECT COUNT(1) FROM mail WHERE imap_mailbox = ?1 AND is_expunged = 0",
+            "SELECT COUNT(DISTINCT m.id)
+             FROM mail m
+             LEFT JOIN mail_source ms
+               ON ms.mail_id = m.id AND ms.source_key = ?1
+             WHERE m.is_expunged = 0
+               AND ((ms.mail_id IS NOT NULL AND ms.is_expunged = 0)
+                    OR (ms.mail_id IS NULL AND m.imap_mailbox = ?1))",
             params![mailbox],
             |row| row.get::<_, i64>(0),
         )
@@ -171,7 +191,10 @@ where
     {
         let mut statement = tx
             .prepare(
-                "SELECT id, subject, raw_path FROM mail WHERE imap_mailbox = ?1 AND is_expunged = 0",
+                "SELECT m.id, m.subject, ms.raw_path
+                 FROM mail m
+                 JOIN mail_source ms ON ms.mail_id = m.id
+                 WHERE ms.source_key = ?1 AND ms.is_expunged = 0 AND m.is_expunged = 0",
             )
             .map_err(|error| {
                 CriewError::with_source(
@@ -223,14 +246,31 @@ where
     }
 
     for (mail_id, _) in &pruned_mail_ids {
-        tx.execute("DELETE FROM mail WHERE id = ?1", params![mail_id])
-            .map_err(|error| {
-                CriewError::with_source(
-                    ErrorCode::Database,
-                    format!("failed to delete pruned mail {}", mail_id),
-                    error,
-                )
-            })?;
+        tx.execute(
+            "UPDATE mail_source SET is_expunged = 1 WHERE mail_id = ?1 AND source_key = ?2",
+            params![mail_id, mailbox],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to mark pruned mail source {}", mail_id),
+                error,
+            )
+        })?;
+        tx.execute(
+            "DELETE FROM mail WHERE id = ?1
+             AND NOT EXISTS (
+                 SELECT 1 FROM mail_source WHERE mail_id = mail.id AND is_expunged = 0
+             )",
+            params![mail_id],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to delete orphaned pruned mail {}", mail_id),
+                error,
+            )
+        })?;
     }
 
     let build = build_thread_index_tx(&tx)?;
@@ -311,13 +351,27 @@ pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult
         // Clearing mailbox rows is cheaper and safer than trying to salvage
         // incremental state across two unrelated UID namespaces.
         tx.execute(
-            "DELETE FROM mail WHERE imap_mailbox = ?1",
+            "UPDATE mail_source SET is_expunged = 1 WHERE source_key = ?1",
             params![batch.mailbox],
         )
         .map_err(|error| {
             CriewError::with_source(
                 ErrorCode::Database,
-                "failed to clear mailbox rows after UIDVALIDITY change",
+                "failed to clear mailbox sources after UIDVALIDITY change",
+                error,
+            )
+        })?;
+        tx.execute(
+            "DELETE FROM mail
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM mail_source WHERE mail_id = mail.id AND is_expunged = 0
+             )",
+            [],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to remove orphaned mails after UIDVALIDITY change",
                 error,
             )
         })?;
@@ -398,17 +452,20 @@ SELECT
     t.id,
     m.id,
     tn.depth,
-    COALESCE(m.imap_mailbox, ''),
+    COALESCE(ms.source_key, m.imap_mailbox, ''),
     m.subject,
     m.from_addr,
     m.message_id,
     m.in_reply_to,
     m.date,
-    m.raw_path
+    COALESCE(ms.raw_path, m.raw_path)
 FROM thread_node tn
 JOIN thread t ON t.id = tn.thread_id
 JOIN mail m ON m.id = tn.mail_id
-WHERE m.imap_mailbox = ?1 AND m.is_expunged = 0
+LEFT JOIN mail_source ms ON ms.mail_id = m.id AND ms.source_key = ?1
+WHERE m.is_expunged = 0
+  AND ((ms.mail_id IS NOT NULL AND ms.is_expunged = 0)
+       OR (ms.mail_id IS NULL AND m.imap_mailbox = ?1))
 ORDER BY
     t.last_activity_at DESC,
     tn.root_mail_id ASC,
@@ -416,7 +473,7 @@ ORDER BY
     tn.depth ASC,
     tn.sort_ts ASC,
     tn.mail_id ASC
-LIMIT ?2
+LIMIT CASE WHEN ?2 <= 0 THEN -1 ELSE ?2 END
 ",
         )
         .map_err(|error| {
@@ -455,6 +512,11 @@ WITH followed_threads AS (
     FROM following_update fu
     LEFT JOIN thread_node tn ON tn.mail_id = fu.mail_id
     WHERE COALESCE(tn.thread_id, fu.thread_id) IS NOT NULL
+), patch_threads AS (
+    SELECT DISTINCT tn.thread_id
+    FROM thread_node tn
+    JOIN mail pm ON pm.id = tn.mail_id
+    WHERE pm.is_expunged = 0 AND lower(pm.subject) LIKE '%[patch%'
 )
 SELECT
     t.id,
@@ -466,13 +528,18 @@ SELECT
     m.message_id,
     m.in_reply_to,
     m.date,
-    m.raw_path
+    COALESCE(
+        (SELECT ms.raw_path FROM mail_source ms
+         WHERE ms.mail_id = m.id AND ms.is_expunged = 0
+         ORDER BY ms.last_seen_at DESC LIMIT 1),
+        m.raw_path
+    )
 FROM thread_node tn
 JOIN thread t ON t.id = tn.thread_id
 JOIN mail m ON m.id = tn.mail_id
 WHERE m.is_expunged = 0
-  AND lower(m.subject) LIKE '%[patch%'
   AND t.id IN (SELECT thread_id FROM followed_threads)
+  AND t.id IN (SELECT thread_id FROM patch_threads)
 ORDER BY
     t.last_activity_at DESC,
     tn.root_mail_id ASC,
@@ -480,7 +547,7 @@ ORDER BY
     tn.depth ASC,
     tn.sort_ts ASC,
     tn.mail_id ASC
-LIMIT ?1
+LIMIT CASE WHEN ?1 <= 0 THEN -1 ELSE ?1 END
 ",
         )
         .map_err(|error| {
@@ -585,6 +652,7 @@ pub fn refresh_following_updates(path: &Path, self_email: &str) -> Result<usize>
         FollowingKind::ToMe,
         FollowingKind::CcMe,
         FollowingKind::SentPatch,
+        FollowingKind::SentReply,
     ] {
         inserted += refresh_following_kind(&tx, &self_email, kind)?;
     }
@@ -630,6 +698,14 @@ WHERE fu.kind = ?1
         AND {predicate}
         AND m.is_expunged = 0
   )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM mail local_m
+      WHERE local_m.id = fu.mail_id
+        AND local_m.imap_mailbox IS NULL
+        AND local_m.is_expunged = 0
+        AND fu.kind IN ('sent_patch', 'sent_reply')
+  )
 "
     );
 
@@ -662,7 +738,169 @@ fn following_update_predicate(kind: FollowingKind) -> &'static str {
                 AND lower(trim(m.subject)) NOT LIKE 'fwd:%'
                 AND instr(lower(m.subject), '[patch') > 0"
         }
+        FollowingKind::SentReply => {
+            "r.kind = 'from'
+                AND (lower(trim(m.subject)) LIKE 're:%'
+                     OR lower(trim(m.subject)) LIKE 'fwd:%'
+                     OR lower(trim(m.subject)) LIKE 'fw:%')
+                AND instr(lower(m.subject), '[patch') > 0"
+        }
     }
+}
+
+pub fn record_following_sent_reply(path: &Path, reply: &FollowingSentReply) -> Result<()> {
+    let mut connection = open_connection(path)?;
+    let tx = connection.transaction().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to begin sent reply Following transaction",
+            error,
+        )
+    })?;
+
+    let existing_mail_id = tx
+        .query_row(
+            "SELECT id FROM mail WHERE message_id = ?1",
+            params![reply.message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to find sent reply {}", reply.message_id),
+                error,
+            )
+        })?;
+    let mail_id = if let Some(mail_id) = existing_mail_id {
+        tx.execute(
+            "UPDATE mail SET subject = ?1, from_addr = ?2, date = ?3,
+                    raw_path = ?4, in_reply_to = ?5, is_expunged = 0
+             WHERE id = ?6 AND imap_mailbox IS NULL",
+            params![
+                reply.subject,
+                reply.from_addr,
+                reply.occurred_at,
+                reply
+                    .raw_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                reply.in_reply_to,
+                mail_id,
+            ],
+        )
+        .map_err(|error| {
+            CriewError::with_source(ErrorCode::Database, "failed to update sent reply", error)
+        })?;
+        mail_id
+    } else {
+        tx.execute(
+            "INSERT INTO mail(message_id, subject, from_addr, date, raw_path, in_reply_to,
+                    imap_mailbox, is_expunged)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0)",
+            params![
+                reply.message_id,
+                reply.subject,
+                reply.from_addr,
+                reply.occurred_at,
+                reply
+                    .raw_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                reply.in_reply_to,
+            ],
+        )
+        .map_err(|error| {
+            CriewError::with_source(ErrorCode::Database, "failed to insert sent reply", error)
+        })?;
+        tx.last_insert_rowid()
+    };
+
+    replace_mail_recipient_values_tx(
+        &tx,
+        mail_id,
+        &reply.from_addr,
+        &reply.to_addrs,
+        &reply.cc_addrs,
+    )?;
+
+    let parent = tx
+        .query_row(
+            "SELECT depth, root_mail_id FROM thread_node WHERE mail_id = ?1 AND thread_id = ?2",
+            params![reply.parent_mail_id, reply.thread_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                "failed to find sent reply parent",
+                error,
+            )
+        })?;
+    let (parent_depth, root_mail_id) = parent.unwrap_or((0, reply.parent_mail_id));
+    tx.execute(
+        "INSERT INTO thread_node(mail_id, thread_id, parent_mail_id, root_mail_id, depth, sort_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(mail_id) DO UPDATE SET thread_id = excluded.thread_id,
+             parent_mail_id = excluded.parent_mail_id, root_mail_id = excluded.root_mail_id,
+             depth = excluded.depth, sort_ts = excluded.sort_ts",
+        params![
+            mail_id,
+            reply.thread_id,
+            reply.parent_mail_id,
+            root_mail_id,
+            parent_depth + 1,
+            reply.occurred_at,
+        ],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to link sent reply thread node",
+            error,
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO following_update(mail_id, thread_id, kind, occurred_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(mail_id, kind) DO UPDATE SET thread_id = excluded.thread_id,
+             occurred_at = excluded.occurred_at",
+        params![
+            mail_id,
+            reply.thread_id,
+            FollowingKind::SentReply.as_str(),
+            reply.occurred_at,
+        ],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to index sent reply Following update",
+            error,
+        )
+    })?;
+    tx.execute(
+        "UPDATE thread SET last_activity_at = ?1,
+                message_count = (SELECT COUNT(*) FROM thread_node WHERE thread_id = ?2)
+         WHERE id = ?2",
+        params![reply.occurred_at, reply.thread_id],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to update sent reply thread",
+            error,
+        )
+    })?;
+
+    tx.commit().map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            "failed to commit sent reply Following update",
+            error,
+        )
+    })
 }
 
 pub fn record_following_sent_patch(path: &Path, patch: &FollowingSentPatch) -> Result<()> {
@@ -766,7 +1004,10 @@ SELECT tn.thread_id, mt.kind, mt.value
 FROM thread_node tn
 JOIN mail m ON m.id = tn.mail_id
 JOIN mail_trailer mt ON mt.mail_id = m.id
-WHERE m.imap_mailbox = ?1 AND m.is_expunged = 0
+LEFT JOIN mail_source ms ON ms.mail_id = m.id AND ms.source_key = ?1
+WHERE m.is_expunged = 0
+  AND ((ms.mail_id IS NOT NULL AND ms.is_expunged = 0)
+       OR (ms.mail_id IS NULL AND m.imap_mailbox = ?1))
 ORDER BY tn.thread_id ASC, mt.mail_id ASC, mt.ord ASC
 ",
         )
@@ -949,27 +1190,19 @@ SET
     subject = ?1,
     from_addr = ?2,
     date = ?3,
-    raw_path = ?4,
-    in_reply_to = ?5,
-    list_id = ?6,
-    flags = ?7,
-    imap_mailbox = ?8,
-    imap_uid = ?9,
-    modseq = ?10,
+    in_reply_to = ?4,
+    list_id = ?5,
+    change_id = ?6,
     is_expunged = 0
-WHERE id = ?11
+WHERE id = ?7
 ",
             params![
                 mail.parsed.subject,
                 mail.parsed.from_addr,
                 mail.parsed.date,
-                mail.raw_path.to_string_lossy().to_string(),
                 mail.parsed.in_reply_to,
                 mail.parsed.list_id,
-                flags,
-                mail.mailbox,
-                mail.uid as i64,
-                mail.modseq.map(|value| value as i64),
+                mail.parsed.change_id,
                 id,
             ],
         )
@@ -996,13 +1229,14 @@ INSERT INTO mail(
     raw_path,
     in_reply_to,
     list_id,
+    change_id,
     flags,
     imap_mailbox,
     imap_uid,
     modseq,
     is_expunged
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)
 ",
             params![
                 mail.parsed.message_id,
@@ -1012,6 +1246,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
                 mail.raw_path.to_string_lossy().to_string(),
                 mail.parsed.in_reply_to,
                 mail.parsed.list_id,
+                mail.parsed.change_id,
                 flags,
                 mail.mailbox,
                 mail.uid as i64,
@@ -1031,6 +1266,37 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
 
         tx.last_insert_rowid()
     };
+
+    // A canonical message may have several source memberships.  Keep source
+    // metadata here instead of overwriting the canonical row on every sync.
+    tx.execute(
+        "
+INSERT INTO mail_source(mail_id, source_key, remote_uid, modseq, flags, raw_path, is_expunged, last_seen_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+ON CONFLICT(mail_id, source_key) DO UPDATE SET
+    remote_uid = excluded.remote_uid,
+    modseq = excluded.modseq,
+    flags = excluded.flags,
+    raw_path = excluded.raw_path,
+    is_expunged = 0,
+    last_seen_at = excluded.last_seen_at
+",
+        params![
+            mail_id,
+            mail.mailbox,
+            mail.uid as i64,
+            mail.modseq.map(|value| value as i64),
+            flags,
+            mail.raw_path.to_string_lossy().to_string(),
+        ],
+    )
+    .map_err(|error| {
+        CriewError::with_source(
+            ErrorCode::Database,
+            format!("failed to upsert source membership for mail {}", mail_id),
+            error,
+        )
+    })?;
 
     tx.execute("DELETE FROM mail_ref WHERE mail_id = ?1", params![mail_id])
         .map_err(|error| {
@@ -1492,14 +1758,55 @@ fn build_thread_assignments(
     nodes: &HashMap<i64, MailGraphNode>,
     parent_map: &HashMap<i64, Option<i64>>,
 ) -> (HashMap<i64, ThreadAssignment>, HashMap<i64, Vec<i64>>) {
+    // When a parent is not in the local store yet, group sibling replies that
+    // carry the same missing reference under a deterministic local anchor.
+    // This prevents every orphan reply from becoming a separate visible
+    // conversation while still allowing a later parent to rethread the group.
+    let mut orphan_anchor: HashMap<String, i64> = HashMap::new();
+    for node in nodes.values() {
+        if parent_map.get(&node.id).copied().flatten().is_some() {
+            continue;
+        }
+        let Some(hint) = node
+            .refs
+            .first()
+            .cloned()
+            .or_else(|| node.in_reply_to.clone())
+        else {
+            continue;
+        };
+        orphan_anchor
+            .entry(hint)
+            .and_modify(|anchor| *anchor = (*anchor).min(node.id))
+            .or_insert(node.id);
+    }
+    let mut effective_parent_map = parent_map.clone();
+    for node in nodes.values() {
+        if parent_map.get(&node.id).copied().flatten().is_some() {
+            continue;
+        }
+        let Some(hint) = node
+            .refs
+            .first()
+            .cloned()
+            .or_else(|| node.in_reply_to.clone())
+        else {
+            continue;
+        };
+        if let Some(anchor) = orphan_anchor.get(&hint).copied()
+            && anchor != node.id
+        {
+            effective_parent_map.insert(node.id, Some(anchor));
+        }
+    }
     let mut assignments: HashMap<i64, ThreadAssignment> = HashMap::new();
     let mut groups: HashMap<i64, Vec<i64>> = HashMap::new();
     let mut memo = HashMap::new();
     for mail_id in nodes.keys().copied() {
         let mut stack = HashSet::new();
         let (root_mail_id, depth) =
-            resolve_thread_assignment(mail_id, parent_map, &mut memo, &mut stack);
-        let parent_mail_id = parent_map
+            resolve_thread_assignment(mail_id, &effective_parent_map, &mut memo, &mut stack);
+        let parent_mail_id = effective_parent_map
             .get(&mail_id)
             .copied()
             .flatten()
@@ -1589,9 +1896,6 @@ fn rebuild_all_threads_tx(tx: &Transaction<'_>, build: &ThreadBuild) -> Result<u
     tx.execute("DELETE FROM thread_node", []).map_err(|error| {
         CriewError::with_source(ErrorCode::Database, "failed to clear thread_node", error)
     })?;
-    tx.execute("DELETE FROM thread", []).map_err(|error| {
-        CriewError::with_source(ErrorCode::Database, "failed to clear thread", error)
-    })?;
 
     let roots: HashSet<i64> = build.groups.keys().copied().collect();
     rebuild_thread_roots_tx(tx, build, &roots)
@@ -1603,28 +1907,71 @@ fn rebuild_thread_roots_tx(
     roots: &HashSet<i64>,
 ) -> Result<usize> {
     let mut rebuilt = 0usize;
+    let mut claimed_thread_ids = HashSet::new();
+    let mut stale_thread_ids = HashSet::new();
     let mut ordered_roots: Vec<i64> = roots.iter().copied().collect();
     ordered_roots.sort_unstable();
 
     for root_mail_id in ordered_roots {
-        tx.execute(
-            "DELETE FROM thread WHERE root_mail_id = ?1",
-            params![root_mail_id],
-        )
-        .map_err(|error| {
-            CriewError::with_source(
-                ErrorCode::Database,
-                format!("failed to delete stale thread for root {}", root_mail_id),
-                error,
+        let stable_key = build
+            .nodes
+            .get(&root_mail_id)
+            .map(|node| format!("msg:{}", node.message_id))
+            .unwrap_or_else(|| format!("mail:{root_mail_id}"));
+        let mut existing_thread_id = tx
+            .query_row(
+                "SELECT id FROM thread WHERE stable_key = ?1 OR root_mail_id = ?2 LIMIT 1",
+                params![stable_key, root_mail_id],
+                |row| row.get::<_, i64>(0),
             )
-        })?;
+            .optional()
+            .map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to find stable thread for root {}", root_mail_id),
+                    error,
+                )
+            })?;
+        if existing_thread_id.is_some_and(|thread_id| claimed_thread_ids.contains(&thread_id)) {
+            existing_thread_id = None;
+        }
 
         let Some(group_mail_ids) = build.groups.get(&root_mail_id) else {
+            if let Some(thread_id) = existing_thread_id {
+                stale_thread_ids.insert(thread_id);
+            }
             continue;
         };
 
         if group_mail_ids.is_empty() {
             continue;
+        }
+
+        // If a previously orphaned conversation gains its real root, the
+        // root's stable key is necessarily new. Reuse the materialized thread
+        // that already owns any member so selections and persisted UI state
+        // survive the rethread.
+        if existing_thread_id.is_none() {
+            for mail_id in group_mail_ids {
+                let candidate = tx
+                    .query_row(
+                        "SELECT thread_id FROM thread_node WHERE mail_id = ?1 LIMIT 1",
+                        params![mail_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        CriewError::with_source(
+                            ErrorCode::Database,
+                            format!("failed to find prior thread for mail {mail_id}"),
+                            error,
+                        )
+                    })?;
+                if candidate.is_some_and(|thread_id| !claimed_thread_ids.contains(&thread_id)) {
+                    existing_thread_id = candidate;
+                    break;
+                }
+            }
         }
 
         let root_subject = build
@@ -1641,26 +1988,64 @@ fn rebuild_thread_roots_tx(
             .filter_map(|mail_id| build.nodes.get(mail_id).map(|node| node.sort_ts.clone()))
             .max();
 
-        tx.execute(
-            "
-INSERT INTO thread(root_mail_id, subject_norm, last_activity_at, message_count)
-VALUES (?1, ?2, ?3, ?4)
-",
-            params![
-                root_mail_id,
-                subject_norm,
-                last_activity_at,
-                group_mail_ids.len() as i64,
-            ],
-        )
-        .map_err(|error| {
-            CriewError::with_source(
-                ErrorCode::Database,
-                format!("failed to insert thread for root {}", root_mail_id),
-                error,
+        let thread_id = if let Some(thread_id) = existing_thread_id {
+            claimed_thread_ids.insert(thread_id);
+            tx.execute(
+                "UPDATE thread
+                 SET root_mail_id = ?1, stable_key = ?2, subject_norm = ?3,
+                     last_activity_at = ?4, message_count = ?5
+                 WHERE id = ?6",
+                params![
+                    root_mail_id,
+                    stable_key,
+                    subject_norm,
+                    last_activity_at,
+                    group_mail_ids.len() as i64,
+                    thread_id,
+                ],
             )
-        })?;
-        let thread_id = tx.last_insert_rowid();
+            .map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to update stable thread {thread_id}"),
+                    error,
+                )
+            })?;
+            tx.execute(
+                "DELETE FROM thread_node WHERE thread_id = ?1",
+                params![thread_id],
+            )
+            .map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to clear existing thread nodes for {thread_id}"),
+                    error,
+                )
+            })?;
+            thread_id
+        } else {
+            tx.execute(
+                "
+INSERT INTO thread(root_mail_id, stable_key, subject_norm, last_activity_at, message_count)
+VALUES (?1, ?2, ?3, ?4, ?5)
+",
+                params![
+                    root_mail_id,
+                    stable_key,
+                    subject_norm,
+                    last_activity_at,
+                    group_mail_ids.len() as i64,
+                ],
+            )
+            .map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to insert thread for root {}", root_mail_id),
+                    error,
+                )
+            })?;
+            tx.last_insert_rowid()
+        };
 
         for mail_id in group_mail_ids {
             let assignment = build.assignments.get(mail_id).copied().ok_or_else(|| {
@@ -1702,6 +2087,23 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         rebuilt += 1;
     }
 
+    for thread_id in stale_thread_ids {
+        if claimed_thread_ids.contains(&thread_id) {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM thread_node WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::Database,
+                format!("failed to clear stale thread nodes for {thread_id}"),
+                error,
+            )
+        })?;
+    }
+
     Ok(rebuilt)
 }
 
@@ -1737,10 +2139,11 @@ mod tests {
     use crate::infra::reply_store;
 
     use super::{
-        IncomingMail, SyncBatch, apply_sync_batch, load_following_kinds_by_thread,
-        load_following_thread_rows, load_mailbox_state, load_thread_rows_by_mailbox,
-        load_thread_trailers_by_mailbox, mailbox_message_count, prune_mailbox_subjects,
-        rebuild_all_threads, record_following_sent_patch,
+        FollowingSentReply, IncomingMail, SyncBatch, apply_sync_batch,
+        load_following_kinds_by_thread, load_following_thread_rows, load_mailbox_state,
+        load_thread_rows_by_mailbox, load_thread_trailers_by_mailbox, mailbox_message_count,
+        prune_mailbox_subjects, rebuild_all_threads, record_following_sent_patch,
+        record_following_sent_reply,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1985,7 +2388,7 @@ mod tests {
         assert!(message_ids.contains("cc@example.com"));
         assert!(message_ids.contains("sent@example.com"));
         assert!(!message_ids.contains("unrelated@example.com"));
-        assert!(!message_ids.contains("sent-reply@example.com"));
+        assert!(message_ids.contains("sent-reply@example.com"));
 
         let kinds_by_thread = load_following_kinds_by_thread(&db_path, "ME@EXAMPLE.COM")
             .expect("load Following kinds");
@@ -2007,6 +2410,10 @@ mod tests {
         assert!(
             kinds_for("sent@example.com")
                 .contains(&crate::domain::following::FollowingKind::SentPatch)
+        );
+        assert!(
+            kinds_for("sent-reply@example.com")
+                .contains(&crate::domain::following::FollowingKind::SentReply)
         );
 
         let repeated = load_following_thread_rows(&db_path, "me@example.com", 100)
@@ -2053,6 +2460,113 @@ mod tests {
         assert_eq!(
             kinds.get(&thread_id),
             Some(&vec![crate::domain::following::FollowingKind::SentPatch])
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn following_view_records_local_sent_reply_as_thread_member() {
+        let root = temp_dir("following-sent-reply");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+        apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "INBOX".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: Some(1),
+                mails: vec![incoming(
+                    "INBOX",
+                    1,
+                    "Message-ID: <root@example.com>\nSubject: [PATCH 0/1] demo\nFrom: alice@example.com\nTo: me@example.com\n\nbody\n",
+                )],
+            },
+        )
+        .expect("seed reply parent");
+        let parent = load_thread_rows_by_mailbox(&db_path, "INBOX", 0)
+            .expect("load reply parent")
+            .into_iter()
+            .next()
+            .expect("reply parent row");
+
+        record_following_sent_reply(
+            &db_path,
+            &FollowingSentReply {
+                parent_mail_id: parent.mail_id,
+                thread_id: parent.thread_id,
+                message_id: "local-reply@example.com".to_string(),
+                from_addr: "Me <me@example.com>".to_string(),
+                to_addrs: vec!["list@example.com".to_string()],
+                cc_addrs: Vec::new(),
+                subject: "Re: [PATCH 0/1] demo".to_string(),
+                in_reply_to: Some("root@example.com".to_string()),
+                raw_path: None,
+                occurred_at: "2026-08-14T10:00:00Z".to_string(),
+            },
+        )
+        .expect("record local reply");
+
+        let rows = load_following_thread_rows(&db_path, "me@example.com", 0)
+            .expect("load local reply in Following");
+        assert!(rows.iter().any(|row| {
+            row.message_id == "local-reply@example.com"
+                && row.subject == "Re: [PATCH 0/1] demo"
+                && row.thread_id == parent.thread_id
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn following_view_keeps_local_sent_reply_when_sender_alias_differs() {
+        let root = temp_dir("following-sent-reply-alias");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+        apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "io-uring".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: Some(1),
+                mails: vec![incoming(
+                    "io-uring",
+                    1,
+                    "Message-ID: <root-alias@example.com>\nSubject: [PATCH 0/1] alias\nFrom: alice@example.com\nTo: canonical@example.com\n\nbody\n",
+                )],
+            },
+        )
+        .expect("seed patch parent");
+        let parent = load_thread_rows_by_mailbox(&db_path, "io-uring", 0)
+            .expect("load patch parent")
+            .into_iter()
+            .next()
+            .expect("patch parent row");
+
+        record_following_sent_reply(
+            &db_path,
+            &FollowingSentReply {
+                parent_mail_id: parent.mail_id,
+                thread_id: parent.thread_id,
+                message_id: "alias-reply@example.com".to_string(),
+                from_addr: "Alias <alias@example.com>".to_string(),
+                to_addrs: vec!["list@example.com".to_string()],
+                cc_addrs: Vec::new(),
+                subject: "Re: [PATCH 0/1] alias".to_string(),
+                in_reply_to: Some("root-alias@example.com".to_string()),
+                raw_path: None,
+                occurred_at: "2026-08-14T10:00:00Z".to_string(),
+            },
+        )
+        .expect("record alias reply");
+
+        let rows = load_following_thread_rows(&db_path, "canonical@example.com", 0)
+            .expect("load alias reply in Following");
+        assert!(
+            rows.iter()
+                .any(|row| row.message_id == "alias-reply@example.com")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -2435,6 +2949,61 @@ END
             mailbox_message_count(&db_path, "inbox").expect("count mails"),
             1
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_message_keeps_independent_source_memberships() {
+        let root = temp_dir("canonical-sources");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let raw = "Message-ID: <same@example.com>\nSubject: [PATCH 1/1] same\nFrom: author@example.com\n\nbody\n";
+        apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "INBOX".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: Some(1),
+                mails: vec![incoming("INBOX", 1, raw)],
+            },
+        )
+        .expect("sync inbox copy");
+        apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "linux-kernel".to_string(),
+                uidvalidity: 9,
+                highest_uid: 42,
+                highest_modseq: Some(42),
+                mails: vec![incoming("linux-kernel", 42, raw)],
+            },
+        )
+        .expect("sync list copy");
+
+        assert_eq!(
+            mailbox_message_count(&db_path, "INBOX").expect("count inbox"),
+            1
+        );
+        assert_eq!(
+            mailbox_message_count(&db_path, "linux-kernel").expect("count list"),
+            1
+        );
+        let inbox = load_thread_rows_by_mailbox(&db_path, "INBOX", 20).expect("load inbox");
+        let list = load_thread_rows_by_mailbox(&db_path, "linux-kernel", 20).expect("load list");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(list.len(), 1);
+        assert_eq!(inbox[0].mail_id, list[0].mail_id);
+        assert_eq!(inbox[0].mailbox, "INBOX");
+        assert_eq!(list[0].mailbox, "linux-kernel");
+
+        let connection = Connection::open(&db_path).expect("open db");
+        let sources: i64 = connection
+            .query_row("SELECT COUNT(*) FROM mail_source", [], |row| row.get(0))
+            .expect("count source memberships");
+        assert_eq!(sources, 2);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2886,6 +3455,7 @@ WHERE m.message_id = 'grand@example.com'
 
         let orphan_rows =
             load_thread_rows_by_mailbox(&db_path, "inbox", 20).expect("load orphaned rows");
+        let orphan_thread_id = orphan_rows[0].thread_id;
         assert_eq!(
             orphan_rows
                 .iter()
@@ -2929,6 +3499,7 @@ WHERE m.message_id = 'grand@example.com'
                 .windows(2)
                 .all(|rows| rows[0].thread_id == rows[1].thread_id)
         );
+        assert_eq!(rethreaded_rows[0].thread_id, orphan_thread_id);
 
         let _ = fs::remove_dir_all(root);
     }

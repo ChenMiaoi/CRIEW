@@ -547,7 +547,11 @@ where
 {
     let mut fetched = Vec::new();
     for entry in entries {
-        if since_modseq.is_some_and(|checkpoint| entry.modseq <= checkpoint) {
+        // Atom timestamps have only second-level precision. Keep entries at
+        // the checkpoint boundary so two messages published in the same
+        // second cannot cause the later one to be lost; the canonical
+        // Message-ID upsert makes this overlap idempotent.
+        if since_modseq.is_some_and(|checkpoint| entry.modseq < checkpoint) {
             continue;
         }
 
@@ -2801,6 +2805,7 @@ mod tests {
             server_port: Some(993),
             encryption: Some(encryption),
             proxy: None,
+            sent_mailbox: None,
         }
     }
 
@@ -3089,6 +3094,7 @@ mod tests {
             server_port: Some(993),
             encryption: Some(ImapEncryption::Tls),
             proxy: None,
+            sent_mailbox: None,
         })
         .err()
         .expect("incomplete config should fail");
@@ -3137,26 +3143,33 @@ mod tests {
         assert_eq!(snapshot.highest_uid, 0);
         assert_eq!(snapshot.highest_modseq, Some(second_modseq));
 
-        let raw_by_url = HashMap::from([(
-            "https://lore.kernel.org/io-uring/msg-b/raw".to_string(),
-            b"Message-ID: <msg-b@example.com>\n\nbody\n".to_vec(),
-        )]);
+        let raw_by_url = HashMap::from([
+            (
+                "https://lore.kernel.org/io-uring/msg-a/raw".to_string(),
+                b"Message-ID: <msg-a@example.com>\n\nbody a\n".to_vec(),
+            ),
+            (
+                "https://lore.kernel.org/io-uring/msg-b/raw".to_string(),
+                b"Message-ID: <msg-b@example.com>\n\nbody b\n".to_vec(),
+            ),
+        ]);
         let fetched = build_lore_incremental_mails(entries, Some(first_modseq), |message_url| {
             fetch_lore_raw_with(message_url, |raw_url| {
                 Ok((200, raw_by_url.get(raw_url).cloned().unwrap_or_default()))
             })
         })
         .expect("fetch incremental lore");
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(fetched[0].modseq, Some(second_modseq));
-        assert!(String::from_utf8_lossy(&fetched[0].raw).contains("msg-b@example.com"));
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0].modseq, Some(first_modseq));
+        assert_eq!(fetched[1].modseq, Some(second_modseq));
+        assert!(String::from_utf8_lossy(&fetched[1].raw).contains("msg-b@example.com"));
     }
 
     #[test]
     fn lore_client_fetches_feed_and_raw_over_http() {
         let first_modseq = parse_atom_timestamp("2026-03-03T09:00:00+00:00").expect("first ts");
         let second_modseq = parse_atom_timestamp("2026-03-03T10:00:00+00:00").expect("second ts");
-        let (base_url, handle) = start_http_server(4, |base_url| {
+        let (base_url, handle) = start_http_server(5, |base_url| {
             let feed = format!(
                 r#"
 <feed xmlns="http://www.w3.org/2005/Atom">
@@ -3177,6 +3190,13 @@ mod tests {
                 (
                     "/io-uring/new.atom".to_string(),
                     StubHttpResponse::text(200, feed),
+                ),
+                (
+                    "/io-uring/msg-a/raw".to_string(),
+                    StubHttpResponse::bytes(
+                        200,
+                        b"Message-ID: <msg-a@example.com>\nSubject: message a\n\nbody a\n".to_vec(),
+                    ),
                 ),
                 (
                     "/io-uring/msg-b/raw".to_string(),
@@ -3205,9 +3225,10 @@ mod tests {
         let fetched = client
             .fetch_incremental("io-uring", 0, Some(first_modseq))
             .expect("fetch lore mails");
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(fetched[0].modseq, Some(second_modseq));
-        assert!(String::from_utf8_lossy(&fetched[0].raw).contains("msg-b@example.com"));
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0].modseq, Some(first_modseq));
+        assert_eq!(fetched[1].modseq, Some(second_modseq));
+        assert!(String::from_utf8_lossy(&fetched[1].raw).contains("msg-b@example.com"));
 
         handle.join().expect("join HTTP server");
     }
@@ -3734,6 +3755,7 @@ mod tests {
             server_port: Some(993),
             encryption: Some(ImapEncryption::Tls),
             proxy: None,
+            sent_mailbox: None,
         };
         session.login(&config).expect("login");
 
@@ -3781,6 +3803,7 @@ mod tests {
             server_port: Some(143),
             encryption: Some(ImapEncryption::None),
             proxy: None,
+            sent_mailbox: None,
         };
         let error = plaintext_session
             .login(&config)
@@ -3832,6 +3855,7 @@ mod tests {
                 server_port: Some(993),
                 encryption: Some(ImapEncryption::Tls),
                 proxy: None,
+                sent_mailbox: None,
             })
             .expect_err("missing user should fail");
         assert!(error.to_string().contains("missing imap.user"));
@@ -3846,6 +3870,7 @@ mod tests {
                 server_port: Some(993),
                 encryption: Some(ImapEncryption::Tls),
                 proxy: None,
+                sent_mailbox: None,
             })
             .expect_err("missing pass should fail");
         assert!(error.to_string().contains("missing imap.pass"));
@@ -3959,6 +3984,7 @@ mod tests {
             server_port: Some(993),
             encryption: Some(ImapEncryption::Tls),
             proxy: None,
+            sent_mailbox: None,
         })
         .err()
         .expect("missing server should fail");
@@ -3972,6 +3998,7 @@ mod tests {
             server_port: None,
             encryption: Some(ImapEncryption::Tls),
             proxy: None,
+            sent_mailbox: None,
         })
         .err()
         .expect("missing port should fail");
@@ -3985,6 +4012,7 @@ mod tests {
             server_port: Some(993),
             encryption: None,
             proxy: None,
+            sent_mailbox: None,
         })
         .err()
         .expect("missing encryption should fail");

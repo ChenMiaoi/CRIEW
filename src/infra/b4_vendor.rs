@@ -16,17 +16,33 @@ use crate::infra::error::{CriewError, ErrorCode, Result};
 struct Asset {
     relative_path: &'static str,
     contents: &'static [u8],
+    #[cfg_attr(not(unix), allow(dead_code))]
     executable: bool,
 }
 
 include!(concat!(env!("OUT_DIR"), "/b4_vendor_assets.rs"));
 
 pub fn ensure_installed(data_dir: &Path) -> Result<Option<PathBuf>> {
+    let root = installation_root(data_dir);
+    // Even when this build was made without the optional vendor submodule,
+    // validate the destination first.  A file at `vendor/` must not silently
+    // turn an unavailable embedded fallback into a misleading `None` result.
+    if let Some(parent) = root.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            CriewError::with_source(
+                ErrorCode::B4,
+                format!(
+                    "failed to create embedded b4 directory {}",
+                    parent.display()
+                ),
+                error,
+            )
+        })?;
+    }
     if ASSETS.is_empty() {
         return Ok(None);
     }
 
-    let root = installation_root(data_dir);
     for asset in ASSETS {
         write_asset(&root, *asset)?;
     }

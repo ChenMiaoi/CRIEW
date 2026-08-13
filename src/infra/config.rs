@@ -45,6 +45,7 @@ startup_sync = true
 # jump_top = ["g", "g"]
 # jump_bottom = ["G"]
 # quick_quit = ["q", "q"]
+# allow_preview_resize = false
 # inbox_auto_sync_interval_secs = 30
 
 [logging]
@@ -133,6 +134,13 @@ pub struct ImapConfig {
     pub server_port: Option<u16>,
     pub encryption: Option<ImapEncryption>,
     pub proxy: Option<String>,
+    /// Optional mailbox containing messages sent outside CRIEW.
+    ///
+    /// Following always discovers incoming activity from INBOX. When this is
+    /// configured, the sync worker also imports patch/reply messages from the
+    /// mailbox with its own checkpoint so locally authored patches are visible
+    /// even when the mail provider does not copy them to INBOX.
+    pub sent_mailbox: Option<String>,
 }
 
 impl ImapConfig {
@@ -205,6 +213,7 @@ pub struct RuntimeConfig {
     pub ui_keymap_base: UiKeymapBase,
     pub ui_custom_keymap: UiCustomKeymapConfig,
     pub inbox_auto_sync_interval_secs: u64,
+    pub allow_preview_resize: bool,
     pub kernel_trees: Vec<PathBuf>,
 }
 
@@ -270,6 +279,7 @@ struct SourceConfig {
 #[derive(Debug, Default, Deserialize)]
 struct UiConfig {
     startup_sync: Option<bool>,
+    allow_preview_resize: Option<bool>,
     keymap: Option<UiKeymap>,
     keymap_base: Option<UiKeymapBase>,
     #[serde(default)]
@@ -291,6 +301,8 @@ struct UiCustomKeymapFileConfig {
 #[derive(Debug, Default, Deserialize)]
 struct ImapFileConfig {
     mailbox: Option<String>,
+    #[serde(alias = "sent")]
+    sent_mailbox: Option<String>,
     email: Option<String>,
     #[serde(alias = "imapuser")]
     user: Option<String>,
@@ -451,6 +463,7 @@ fn build_runtime_config(
             "ui.inbox_auto_sync_interval_secs must be greater than 0",
         ));
     }
+    let allow_preview_resize = file_config.ui.allow_preview_resize.unwrap_or(false);
 
     let mut kernel_trees = Vec::new();
     if let Some(tree) = file_config.kernel.tree {
@@ -482,6 +495,7 @@ fn build_runtime_config(
         ui_keymap_base,
         ui_custom_keymap,
         inbox_auto_sync_interval_secs,
+        allow_preview_resize,
         kernel_trees,
     })
 }
@@ -823,6 +837,7 @@ where
             .find_map(&env_lookup)
             .and_then(|value| normalize_optional_string(Some(value)))
         }),
+        sent_mailbox: normalize_optional_string(file_config.sent_mailbox.clone()),
     };
     if config.server_port == Some(0) {
         return Err(CriewError::new(
@@ -1201,6 +1216,7 @@ mailbox = "linux-kernel"
 
 [imap]
 email = "me@example.com"
+sent_mailbox = "Sent"
 imapuser = "imap-user"
 imappass = "imap-pass"
 imapserver = "imap.example.com"
@@ -1212,6 +1228,7 @@ imapencryption = "tls"
 
         let loaded = load(Some(&config_path)).expect("load config");
         assert_eq!(loaded.imap.email.as_deref(), Some("me@example.com"));
+        assert_eq!(loaded.imap.sent_mailbox.as_deref(), Some("Sent"));
         assert_eq!(loaded.imap.user.as_deref(), Some("imap-user"));
         assert_eq!(loaded.imap.pass.as_deref(), Some("imap-pass"));
         assert_eq!(loaded.imap.server.as_deref(), Some("imap.example.com"));

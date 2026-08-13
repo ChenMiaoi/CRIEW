@@ -118,6 +118,9 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     state.clear_pending_main_page_count();
 
     match key.code {
+        KeyCode::Char('?') => {
+            state.status = "j/k move | Enter preview | x expand/collapse replies | / search | : commands | Esc close".to_string();
+        }
         KeyCode::Char('/') => {
             if matches!(state.ui_page, UiPage::Mail) {
                 state.open_search();
@@ -169,6 +172,20 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         {
             state.open_reply_panel(false);
         }
+        KeyCode::Char('[')
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Preview)
+                && state.has_selected_patch_series() =>
+        {
+            state.select_patch_member(false);
+        }
+        KeyCode::Char(']')
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Preview)
+                && state.has_selected_patch_series() =>
+        {
+            state.select_patch_member(true);
+        }
         KeyCode::Char('[') if matches!(state.ui_page, UiPage::Mail) => {
             state.resize_mail_panes(HorizontalResizeDirection::Left, MailPaneResizeMode::Expand);
         }
@@ -218,6 +235,11 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
             } else {
                 state.status = "select a thread before fetching its complete thread".to_string();
             }
+        }
+        KeyCode::Char('x')
+            if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Threads) =>
+        {
+            state.toggle_selected_thread_expansion();
         }
         KeyCode::Char(character)
             if matches!(state.ui_page, UiPage::Mail)

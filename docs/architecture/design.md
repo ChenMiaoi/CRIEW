@@ -134,8 +134,8 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
 - `mail_recipient`
   - `mail_id`, `kind`（from/to/cc）, `address`, `ord`；用于按自身邮箱地址检索关注更新
 - `following_update`
-  - `mail_id`, `thread_id`, `kind`（to_me/cc_me/sent_patch）, `occurred_at`, `seen_at`
-  - 将收件人命中和本地已发 patch 物化为可聚合的 Following 更新记录
+  - `mail_id`, `thread_id`, `kind`（to_me/cc_me/sent_patch/sent_reply）, `occurred_at`, `seen_at`
+  - 将收件人命中和自己发送的 patch/reply 物化为可聚合的 Following 更新记录
 - `thread`
   - `id`, `root_mail_id`, `subject_norm`, `last_activity_at`, `message_count`
 - `thread_node`
@@ -177,15 +177,18 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
 
 - 同步目标由“已启用订阅”决定，但按 `source` 分流：
   `Following` 使用 `source=imap`，子系统模板继续使用 `source=lore`。
-- `Following` 是虚拟视图，固定映射到 IMAP `INBOX`；`INBOX` 只作为隐藏后端源，
-  不在左栏作为第二个可见订阅。
+- `Following` 是虚拟视图，默认以 IMAP `INBOX` 做收件发现；所有已同步来源中由自己
+  发送的 patch/reply 也会投影到同一视图。`INBOX` 只作为隐藏后端源，不在左栏作为
+  第二个可见订阅。若配置 `[imap].sent_mailbox`，还会以独立 checkpoint 增量读取该
+  Sent 文件夹中的自己发送的 patch/reply。
 - 自身邮箱地址解析优先级固定为：`[imap].email` -> `git config user.email`。
   `user` 用于 IMAP 认证；若未显式设置，则回退到 `[imap].email` 作为登录身份。
 - 真实 IMAP 连接要求 `user`、`pass`、`server`、`serverport`、`encryption`
   五项齐备；`encryption` 首版固定枚举 `tls` / `starttls` / `none`。
 
 1. 解析已启用订阅，并按 `source` 分成 `imap_subscriptions` 与 `lore_subscriptions`。
-2. 对 `imap_subscriptions`：`Following` 使用 `INBOX`，基于 `[imap]` 配置建立 IMAP 会话，
+2. 对 `imap_subscriptions`：`Following` 使用 `INBOX`，并在配置了
+   `[imap].sent_mailbox` 时追加同步 Sent 文件夹；基于 `[imap]` 配置建立 IMAP 会话，
    按 `encryption` 完成 TLS/STARTTLS/plain 连接并执行最小 `LOGIN` 认证。
 3. `SELECT` 对应 IMAP mailbox，读取 `UIDVALIDITY`、`UIDNEXT`、`HIGHESTMODSEQ`。
 4. 读取本地 `imap_mailbox_state`，对比同步断点。
@@ -195,8 +198,10 @@ kernel 邮件列表协作场景，目标是把「订阅 -> 阅读 -> 过滤 -> �
    不经过 IMAP。
 8. 两类来源的邮件都在单事务中落盘 `.eml`、解析头部、写入 `mail`/`mail_ref`/`mail_recipient`。
 9. 基于 JWZ 规则局部更新 `thread`/`thread_node`，并聚合 patch series。
-10. 对 `Following`，IMAP 通过 `UID SEARCH HEADER TO/CC/FROM` 先筛选增量 UID；本地再以
-    规范化邮箱地址生成 `following_update`，分别标记 `TO`、`CC`、`SENT`。
+10. 对 `Following`，IMAP 通过 `UID SEARCH HEADER TO/CC/FROM` 先筛选增量 UID；若配置了
+    `sent_mailbox`，该文件夹只保留自己发送的 patch/reply；本地再以
+    规范化邮箱地址生成 `following_update`，分别标记 `TO`、`CC`、`SENT`，并把已同步
+    mailing-list 中自己发送的 patch/reply 纳入相同投影。
 11. 提交事务并更新对应来源的 checkpoint；IMAP 路径更新
     `last_seen_uid`/`highest_modseq`。
 
@@ -391,10 +396,12 @@ MVP 范围与阶段目标已迁移至独立文档：
 
 ### 16.1 已决策项
 
-- patch 工作流数据落库新增 `patch_series`、`patch_series_item`、`patch_series_run` 三表，
-  用于 series 状态机、条目明细和执行日志持久化。
-- series 识别规则固定为解析主题前缀 `[PATCH vN M/N]`，按 thread 聚合并默认选择
-  当前 thread 中最高版本（最大 `vN`）作为可操作 series。
+- patch 工作流现在同时落库 `patch_change`、`patch_revision`、`patch_member`、
+  `patch_followup`，把 series 身份、reroll、成员和讨论回复分开保存；执行状态仍复用
+  既有 patch workflow 表。
+- series 识别解析 `[PATCH vN M/N]`，优先使用重复出现的 Change-ID，随后按作者、cover
+  标题族和版本做启发式归并。series 不再依赖单个 thread：v1/v2 可以跨 thread 归入同一
+  change，reply 进入 follow-up，不会伪装成 patch member。
 - 完整性校验在 M3 固定三类：缺片（missing）、重复（duplicate）、乱序（out-of-order）；
   仅 `complete` 状态允许执行 apply/download。
 - b4 执行在 M3 统一由 CRIEW 封装，固定超时控制、退出码收集、stdout/stderr 持久化，
@@ -404,8 +411,14 @@ MVP 范围与阶段目标已迁移至独立文档：
 
 ### 16.2 风险与后续动作
 
-- 当前 series 聚合依赖已加载到线程页的数据窗口（默认 500 行）；超长 thread 可能需要
-  后续改为全量按 thread_id 查询以避免识别误差。
+- series catalog 从全部 active source membership 重建，TUI 不再用 500 行窗口决定 series
+  是否完整；缺片会触发同步阶段的 header 补全，并在目录中明确显示 `partial` 与缺失序号。
+- canonical `mail` 与 `mail_source` 分离，Message-ID 相同但来源不同的副本共享内容身份、
+  各自保留 mailbox/UID/raw path；thread 使用 stable key，迟到父邮件重建时保持 thread ID。
+- TUI 默认折叠 patch 讨论回复，`x` 展开/收起，`[`/`]` 在预览焦点切换 series member；
+  My Mail 保持回复默认可见；自己的 `Re:`/`Fwd:` 回信也会作为本地 thread member
+  归档并显示。普通 mailing-list 会话仍保留折叠行为，预览 resize 可由
+  `ui.allow_preview_resize` 显式启用。
 - 目前 download/apply 都走 `b4 am` 封装，后续可按维护者工作流评估是否补充
   `b4 mbox` / `b4 shazam` 分流策略与更细粒度参数模板。
 - 执行日志目前以内嵌文本保存在 SQLite，后续可增加日志滚动与大小配额，防止长期使用后数据库膨胀。
@@ -417,7 +430,7 @@ MVP 范围与阶段目标已迁移至独立文档：
 - 真实 IMAP 接入继续复用 M2 已落地的 checkpoint、幂等去重、JWZ threading
   与 mailbox 状态持久化模型，不重做数据层。
 - `[imap]` 配置段首版固定字段为：`email`、`user`、`pass`、`server`、
-  `serverport`、`encryption`；并兼容 legacy alias `imapuser`、`imappass`、
+  `serverport`、`encryption`，以及可选的 `sent_mailbox`；并兼容 legacy alias `imapuser`、`imappass`、
   `imapserver`、`imapserverport`、`imapencryption`。其中 `email` 用于“自己”
   语义，`user` 用于认证，二者允许不同。
 - 自身邮箱地址解析优先级固定为：`[imap].email` -> `git config user.email`；
@@ -425,8 +438,9 @@ MVP 范围与阶段目标已迁移至独立文档：
 - TUI 左栏新增内置 `Following` 订阅，映射 IMAP `INBOX`，在 IMAP 配置完整时
   默认启用并参与启动自动同步；TUI 保持打开期间，`Following` 继续按
   `ui.inbox_auto_sync_interval_secs` 指定的间隔做后台增量同步，默认 30 秒。
-  通过 `To`、`Cc`、自身 `From` 的 header search 发现邮件，并将独立发送的 patch
-  记录为 `SENT` 更新；线程行显示 `TO`/`CC`/`SENT` 标记。
+  通过 `To`、`Cc`、自身 `From` 的 header search 发现邮件，并将独立发送的 patch/reply
+  记录为 `SENT` 更新；线程行显示 `TO`/`CC`/`SENT` 标记。已同步 Lore patch 中
+  自身发送的 `Re: [PATCH ...]` 也会进入该投影。
   其余 vger 模板订阅仍保持默认禁用，并继续使用 lore/web 抓取，不切换到 IMAP。
 - 真实 IMAP 客户端首版覆盖 `LOGIN`、`SELECT`、`UID SEARCH`、`UID FETCH`
   最小链路，并复用既有 checkpoint、幂等写入和 `UIDVALIDITY` 重建逻辑。

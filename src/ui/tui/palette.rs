@@ -37,11 +37,16 @@ pub(super) fn run_palette_local_command(state: &mut AppState, local_command: &st
         }
     };
 
-    let output = ProcessCommand::new("bash")
-        .arg("-lc")
-        .arg(local_command)
-        .current_dir(&cwd)
-        .output();
+    let mut command = if cfg!(windows) {
+        let mut command = ProcessCommand::new("powershell");
+        command.args(["-NoProfile", "-Command", local_command]);
+        command
+    } else {
+        let mut command = ProcessCommand::new("bash");
+        command.args(["-lc", local_command]);
+        command
+    };
+    let output = command.current_dir(&cwd).output();
 
     match output {
         Ok(output) => {

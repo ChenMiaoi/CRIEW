@@ -313,7 +313,18 @@ pub(super) fn extract_mail_body_text(raw: &[u8]) -> String {
         .unwrap_or(0);
 
     let body = &raw[body_start..];
-    let text = String::from_utf8_lossy(body).replace("\r\n", "\n");
+    let transfer_encoding = preview_header_value(
+        &parse_preview_header_block(raw),
+        "content-transfer-encoding",
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    let decoded = match transfer_encoding.as_str() {
+        value if value.contains("quoted-printable") => decode_quoted_printable(body),
+        value if value.contains("base64") => decode_base64(body),
+        _ => body.to_vec(),
+    };
+    let text = String::from_utf8_lossy(&decoded).replace("\r\n", "\n");
     let stripped = strip_first_mime_part_headers(&text);
 
     let sanitized = sanitize_preview_text(&stripped);
@@ -328,13 +339,77 @@ pub(super) fn extract_mail_body_text(raw: &[u8]) -> String {
 
 pub(super) fn extract_mail_body_preview(raw: &[u8]) -> String {
     let body_text = extract_mail_body_text(raw);
-    let lines: Vec<&str> = body_text.lines().take(80).collect();
-
-    let snippet = lines.join("\n");
-    if snippet.trim().is_empty() {
+    if body_text.trim().is_empty() {
         "<empty mail body>".to_string()
     } else {
-        snippet
+        body_text
+    }
+}
+
+fn decode_quoted_printable(raw: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'=' {
+            if index + 2 < raw.len() && raw[index + 1] == b'\r' && raw[index + 2] == b'\n' {
+                index += 3;
+                continue;
+            }
+            if index + 2 < raw.len() && raw[index + 1] == b'\n' {
+                index += 2;
+                continue;
+            }
+            if index + 2 < raw.len() {
+                let high = hex_value(raw[index + 1]);
+                let low = hex_value(raw[index + 2]);
+                if let (Some(high), Some(low)) = (high, low) {
+                    output.push((high << 4) | low);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+        output.push(raw[index]);
+        index += 1;
+    }
+    output
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_base64(raw: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for value in raw.iter().copied() {
+        let Some(value) = base64_value(value) else {
+            continue;
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    output
+}
+
+fn base64_value(value: u8) -> Option<u8> {
+    match value {
+        b'A'..=b'Z' => Some(value - b'A'),
+        b'a'..=b'z' => Some(value - b'a' + 26),
+        b'0'..=b'9' => Some(value - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 

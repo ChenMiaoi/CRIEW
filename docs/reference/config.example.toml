@@ -42,6 +42,10 @@ filter = "info"
 # Optional self email address for matching your own mail.
 # When `imap.user` is omitted, CRIEW also uses this as the IMAP login identity.
 # email = "you@example.com"
+# Optional mailbox for messages sent outside CRIEW. When set, Following also
+# imports your own patch/reply messages from this mailbox with an independent
+# checkpoint (for example `Sent` or `[Gmail]/Sent Mail`).
+# sent_mailbox = "Sent"
 
 # For Gmail, setting sendemail.smtpServer=smtp.gmail.com in ~/.gitconfig is
 # enough to select IMAP defaults. CRIEW reuses sendemail.smtpUser/smtpPass;

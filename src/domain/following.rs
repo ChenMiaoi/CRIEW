@@ -9,6 +9,7 @@ pub enum FollowingKind {
     ToMe,
     CcMe,
     SentPatch,
+    SentReply,
 }
 
 impl FollowingKind {
@@ -17,6 +18,7 @@ impl FollowingKind {
             Self::ToMe => "to_me",
             Self::CcMe => "cc_me",
             Self::SentPatch => "sent_patch",
+            Self::SentReply => "sent_reply",
         }
     }
 
@@ -25,6 +27,7 @@ impl FollowingKind {
             Self::ToMe => "TO",
             Self::CcMe => "CC",
             Self::SentPatch => "SENT",
+            Self::SentReply => "SENT",
         }
     }
 
@@ -33,6 +36,7 @@ impl FollowingKind {
             "to_me" => Some(Self::ToMe),
             "cc_me" => Some(Self::CcMe),
             "sent_patch" => Some(Self::SentPatch),
+            "sent_reply" => Some(Self::SentReply),
             _ => None,
         }
     }
@@ -48,6 +52,7 @@ mod tests {
             FollowingKind::ToMe,
             FollowingKind::CcMe,
             FollowingKind::SentPatch,
+            FollowingKind::SentReply,
         ] {
             assert_eq!(FollowingKind::from_str(kind.as_str()), Some(kind));
         }

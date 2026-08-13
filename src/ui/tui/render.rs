@@ -32,7 +32,7 @@ enum VerticalScrollWrapMode {
 pub(super) fn draw(
     frame: &mut Frame<'_>,
     state: &AppState,
-    config: &RuntimeConfig,
+    _config: &RuntimeConfig,
     _bootstrap: &BootstrapState,
 ) {
     // Keep header, body, and footer in fixed bands so transient overlays do
@@ -90,7 +90,7 @@ pub(super) fn draw(
         ),
         Span::raw("   "),
         Span::styled(
-            format!("{} threads", state.filtered_thread_indices.len()),
+            format!("{} conversations", state.visible_thread_count()),
             Style::default()
                 .fg(Color::White)
                 .bg(HEADER_BG)
@@ -131,7 +131,7 @@ pub(super) fn draw(
             let panes = mail_page_panes(areas[1], state.mail_pane_layout);
             draw_subscriptions(frame, panes[0], state);
             draw_threads(frame, panes[1], state);
-            draw_preview(frame, panes[2], state, config);
+            draw_preview(frame, panes[2], state);
         }
         UiPage::CodeBrowser => {
             draw_code_browser_page(frame, areas[1], state);
@@ -160,7 +160,7 @@ pub(super) fn draw(
             "/ search | Tab page | : palette | Enter | e/r reply".to_string()
         }
         UiPage::Mail => format!(
-            "/ search | Tab page | : palette | Enter | e/r reply | [ ] expand pane | {{ }} shrink pane | {}",
+            "? help | / search | Tab page | : palette | Enter | x expand | e/r reply | [ ] pane | {{ }} shrink | {}",
             main_page_navigation_shortcuts(&state.main_page_keymap)
         ),
         UiPage::CodeBrowser if state.is_code_edit_active() => {
@@ -459,6 +459,8 @@ fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     row.thread_id,
                     visible_count,
                     state.series_summaries.get(&row.thread_id),
+                    state.catalog_for_thread(row.thread_id),
+                    state.expanded_thread_ids.contains(&row.thread_id),
                     state.review_summaries.get(&row.thread_id),
                     state.following_kinds.get(&row.thread_id).map(Vec::as_slice),
                 ))
@@ -494,12 +496,32 @@ fn thread_group_line(
     thread_id: i64,
     visible_count: usize,
     series: Option<&patch_worker::SeriesSummary>,
+    catalog: Option<&crate::infra::series_store::SeriesCatalog>,
+    expanded: bool,
     review: Option<&review_worker::ReviewInboxEntry>,
     following: Option<&[FollowingKind]>,
 ) -> String {
     let noun = if visible_count == 1 { "msg" } else { "msgs" };
-    let mut line = format!("Thread {thread_id} ({visible_count} {noun})");
-    if let Some(series) = series {
+    let marker = if expanded { "▼" } else { "▶" };
+    let mut line = if let Some(catalog) = catalog {
+        format!(
+            "{marker} Series v{} {}/{} {} | {}",
+            catalog.revision,
+            catalog
+                .members
+                .iter()
+                .filter(|member| member.seq > 0)
+                .count(),
+            catalog.expected_total,
+            catalog.completeness,
+            catalog.subject,
+        )
+    } else {
+        format!("{marker} Thread {thread_id} ({visible_count} {noun})")
+    };
+    if catalog.is_none()
+        && let Some(series) = series
+    {
         line.push_str(&format!(
             " | v{} {}/{} | integrity={} | status={}",
             series.version,
@@ -587,11 +609,10 @@ pub(super) fn sanitize_inline_ui_text(value: &str) -> String {
     sanitized.trim().to_string()
 }
 
-fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &RuntimeConfig) {
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let (warning, preview) = if let Some(thread) = state.selected_thread() {
         if let Some(mail_preview) = state.selected_mail_preview() {
-            let preview = if let Some(series_details) =
-                load_series_preview(state, config, thread.thread_id)
+            let preview = if let Some(series_details) = load_series_preview(state, thread.thread_id)
             {
                 Cow::Owned(format!("{series_details}\n\n{}", mail_preview.content))
             } else {
@@ -609,8 +630,8 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
             None,
             Cow::Owned(format!(
                 "No synced thread data\n\nRun:\n  criew sync --fixture-dir <DIR>\n\nConfig: {}\nDatabase: {}",
-                config.config_path.display(),
-                config.database_path.display(),
+                state.runtime.config_path.display(),
+                state.runtime.database_path.display(),
             )),
         )
     };
@@ -643,11 +664,16 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         inner_area
     };
 
+    let wrap_mode = if state.has_selected_patch_series() {
+        VerticalScrollWrapMode::Disabled
+    } else {
+        VerticalScrollWrapMode::Enabled
+    };
     let preview_scroll_limit = max_vertical_scroll(
         preview.as_ref(),
         content_area.width,
         content_area.height,
-        VerticalScrollWrapMode::Enabled,
+        wrap_mode,
     );
     state.preview_scroll_limit.set(preview_scroll_limit);
     let scroll = clamp_vertical_scroll(
@@ -655,12 +681,13 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         content_area.width,
         content_area.height,
         state.preview_scroll,
-        VerticalScrollWrapMode::Enabled,
+        wrap_mode,
     );
     let preview_text = colorize_mail_preview(preview.as_ref());
-    let paragraph = Paragraph::new(preview_text)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
+    let mut paragraph = Paragraph::new(preview_text).scroll((scroll, 0));
+    if matches!(wrap_mode, VerticalScrollWrapMode::Enabled) {
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
 
     frame.render_widget(paragraph, content_area);
 }
@@ -684,57 +711,69 @@ fn colorize_mail_preview(content: &str) -> Text<'static> {
     Text::from(lines)
 }
 
+fn strip_preview_quote_prefix(line: &str) -> &str {
+    let mut unquoted = line.trim_start();
+    while let Some(rest) = unquoted.strip_prefix('>') {
+        unquoted = rest.trim_start();
+    }
+    unquoted
+}
+
+fn is_patch_preview_line(line: &str, context: &PreviewColorContext) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("@@")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || (context.in_patch
+            && (line.starts_with('-')
+                || line.starts_with('+')
+                || line.starts_with("\\ No newline")))
+}
+
 fn preview_line_style(line: &str, context: &mut PreviewColorContext) -> Style {
     let trimmed = line.trim_start();
-    if let Some(quoted_line) = trimmed.strip_prefix('>').map(str::trim_start)
-        && (quoted_line.starts_with("diff --git ")
-            || quoted_line.starts_with("@@")
-            || quoted_line.starts_with("--- ")
-            || quoted_line.starts_with("+++ ")
-            || (context.in_patch
-                && (quoted_line.starts_with('-')
-                    || quoted_line.starts_with('+')
-                    || quoted_line.starts_with("\\ No newline"))))
-    {
-        return preview_line_style(quoted_line, context);
+    let unquoted = strip_preview_quote_prefix(trimmed);
+    if unquoted != trimmed && is_patch_preview_line(unquoted, context) {
+        return preview_line_style(unquoted, context);
     }
-    if trimmed.starts_with("```") {
+
+    if unquoted.starts_with("```") {
         context.in_code_fence = !context.in_code_fence;
         return Style::default()
             .fg(Color::LightCyan)
             .add_modifier(Modifier::BOLD);
     }
 
-    if line.starts_with("diff --git ") {
+    if unquoted.starts_with("diff --git ") {
         context.in_patch = true;
         context.pending_old_file = false;
         return Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD);
     }
-    if line.starts_with("@@") {
+    if unquoted.starts_with("@@") {
         context.in_patch = true;
         context.pending_old_file = false;
         return Style::default()
             .fg(Color::LightBlue)
             .add_modifier(Modifier::BOLD);
     }
-    if context.in_patch && line.starts_with("--- ") {
+    if context.in_patch && unquoted.starts_with("--- ") {
         context.pending_old_file = true;
         return Style::default().fg(Color::LightRed);
     }
-    if context.pending_old_file && line.starts_with("+++ ") {
+    if context.pending_old_file && unquoted.starts_with("+++ ") {
         context.pending_old_file = false;
         context.in_patch = true;
         return Style::default().fg(Color::LightGreen);
     }
-    if context.in_patch && line.starts_with('-') {
+    if context.in_patch && unquoted.starts_with('-') {
         return Style::default().fg(Color::LightRed);
     }
-    if context.in_patch && line.starts_with('+') {
+    if context.in_patch && unquoted.starts_with('+') {
         return Style::default().fg(Color::LightGreen);
     }
-    if context.in_patch && line.starts_with("\\ No newline") {
+    if context.in_patch && unquoted.starts_with("\\ No newline") {
         return Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC);
@@ -821,19 +860,69 @@ fn wrapped_visual_line_count(line: &str, area_width: u16) -> usize {
     display_width.saturating_add(width - 1) / width
 }
 
-fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64) -> Option<String> {
-    let series = state.series_summaries.get(&thread_id)?;
-    let mut lines = vec![
-        format!(
+fn load_series_preview(state: &AppState, thread_id: i64) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(series) = state.series_summaries.get(&thread_id) {
+        lines.push(format!(
             "Series: v{} {}/{} | integrity={} | status={}",
             series.version,
             series.present_count(),
             series.expected_total,
             series.integrity.short_label(),
             series.status_label()
-        ),
-        format!("Anchor: <{}>", series.anchor_message_id),
-    ];
+        ));
+        lines.push(format!("Anchor: <{}>", series.anchor_message_id));
+
+        if !series.missing_seq.is_empty() {
+            lines.push(format!(
+                "Missing: {}",
+                series
+                    .missing_seq
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if !series.duplicate_seq.is_empty() {
+            lines.push(format!(
+                "Duplicate: {}",
+                series
+                    .duplicate_seq
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    } else {
+        let catalog = state.catalog_for_thread(thread_id)?;
+        lines.push(format!(
+            "Series: v{} {}/{} | completeness={} | status={}",
+            catalog.revision,
+            catalog
+                .members
+                .iter()
+                .filter(|member| member.seq > 0)
+                .count(),
+            catalog.expected_total,
+            catalog.completeness,
+            catalog.status
+        ));
+        lines.push(format!("Change: {}", catalog.change_key));
+        lines.push(format!("Follow-ups: {}", catalog.followup_count));
+        if !catalog.missing.is_empty() {
+            lines.push(format!(
+                "Missing: {}",
+                catalog
+                    .missing
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    }
 
     if let Some(review) = state.review_summaries.get(&thread_id) {
         lines.push(format!(
@@ -843,50 +932,6 @@ fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64)
         ));
         for (kind, values) in review.trailer_groups() {
             lines.push(format!("{kind}: {}", values.join(", ")));
-        }
-    }
-
-    if !series.missing_seq.is_empty() {
-        lines.push(format!(
-            "Missing: {}",
-            series
-                .missing_seq
-                .iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-    if !series.duplicate_seq.is_empty() {
-        lines.push(format!(
-            "Duplicate: {}",
-            series
-                .duplicate_seq
-                .iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-
-    match patch_worker::load_latest_report(&config.database_path, &series.mailbox, thread_id) {
-        Ok(Some(report)) => {
-            if let Some(summary) = report.last_summary.as_deref() {
-                lines.push(format!("Last run: {summary}"));
-            }
-            if let Some(exit_code) = report.last_exit_code {
-                lines.push(format!("Exit code: {exit_code}"));
-            }
-            if let Some(command) = report.last_command.as_deref() {
-                lines.push(format!("Command: {command}"));
-            }
-            if let Some(error) = report.last_error.as_deref() {
-                lines.push(format!("Error: {error}"));
-            }
-        }
-        Ok(None) => {}
-        Err(error) => {
-            lines.push(format!("Series report load failed: {error}"));
         }
     }
 
@@ -1779,9 +1824,17 @@ mod tests {
 
     #[test]
     fn mail_preview_colorizes_quoted_patch_reply_diff() {
-        let text = colorize_mail_preview(
-            "> diff --git a/a.c b/a.c\n> @@ -1 +1 @@\n> -old\n> +new",
-        );
+        let text = colorize_mail_preview("> diff --git a/a.c b/a.c\n> @@ -1 +1 @@\n> -old\n> +new");
+        assert_eq!(text.lines[0].spans[0].style.fg, Some(Color::Magenta));
+        assert_eq!(text.lines[1].spans[0].style.fg, Some(Color::LightBlue));
+        assert_eq!(text.lines[2].spans[0].style.fg, Some(Color::LightRed));
+        assert_eq!(text.lines[3].spans[0].style.fg, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn mail_preview_colorizes_nested_quoted_patch_reply_diff() {
+        let text =
+            colorize_mail_preview("> > diff --git a/a.c b/a.c\n>> @@ -1 +1 @@\n> > -old\n>> +new");
         assert_eq!(text.lines[0].spans[0].style.fg, Some(Color::Magenta));
         assert_eq!(text.lines[1].spans[0].style.fg, Some(Color::LightBlue));
         assert_eq!(text.lines[2].spans[0].style.fg, Some(Color::LightRed));
