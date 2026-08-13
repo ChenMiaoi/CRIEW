@@ -40,13 +40,11 @@ criew outbox
 criew tui
 ```
 
-When IMAP is configured, the TUI exposes a virtual `Following` view instead of
-requiring a separate personal inbox subscription. It is discovered with the
-configured self email address: messages sent to you (`To`), copied to you
-(`Cc`), and patch messages you send are indexed as thread updates
-and shown with `TO`, `CC`, or `SENT` badges. CRIEW searches the IMAP `INBOX`
-by header and keeps that mailbox as an internal sync source; `INBOX` is not a
-second visible subscription.
+When IMAP is configured, the TUI exposes a virtual `My Mail` view instead of
+requiring a separate personal inbox subscription. It contains messages sent
+to you (`To`), copied to you (`Cc`), and patches sent by you (`From`), marked
+with `TO`, `CC`, and `SENT` badges. CRIEW searches and syncs the IMAP `INBOX`
+as an internal source; `INBOX` is not shown as a second user-facing view.
 
 When an incremental sync only captured part of a conversation, run
 `fetch-thread` with any Message-ID from that conversation. The command follows

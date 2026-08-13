@@ -257,9 +257,8 @@ const THREAD_LINE_MAX_CHARS: usize = 120;
 const KERNEL_TREE_MAX_ROWS: usize = 2048;
 const CODE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 const CODE_PREVIEW_MAX_LINES: usize = 800;
-const FOLLOWING_LABEL: &str = "Following";
-// Kept as a source-level compatibility alias for existing TUI tests and
-// helper code; the visible subscription is now named Following.
+const FOLLOWING_LABEL: &str = "My Mail";
+// Internal compatibility name: mailbox identity remains the virtual IMAP view.
 #[cfg(test)]
 const MY_INBOX_LABEL: &str = FOLLOWING_LABEL;
 const CONFIG_GET_KEYS: &[&str] = &[
@@ -6199,21 +6198,21 @@ fn default_subscriptions(
         })
         .collect();
 
-    if runtime.imap.is_complete() {
-        // Following is special: it is backed by the private IMAP INBOX but is
-        // discovered through recipient searches instead of exposing raw INBOX.
-        let enable_following = mailbox_set_contains(enabled_mailboxes, FOLLOWING_VIEW)
-            || my_inbox_default.should_enable_when_missing();
-        items.insert(
-            0,
-            SubscriptionItem {
-                mailbox: IMAP_INBOX_MAILBOX.to_string(),
-                label: FOLLOWING_LABEL.to_string(),
-                enabled: enable_following,
-                category: None,
-            },
-        );
-    }
+    // My Mail is the user-facing aggregate of mail sent to, copied to, and
+    // sent by the configured identity. It is visible before IMAP setup so the
+    // workflow is discoverable; only a complete IMAP config enables syncing.
+    let enable_my_mail = runtime.imap.is_complete()
+        && (mailbox_set_contains(enabled_mailboxes, FOLLOWING_VIEW)
+            || my_inbox_default.should_enable_when_missing());
+    items.insert(
+        0,
+        SubscriptionItem {
+            mailbox: IMAP_INBOX_MAILBOX.to_string(),
+            label: FOLLOWING_LABEL.to_string(),
+            enabled: enable_my_mail,
+            category: None,
+        },
+    );
 
     if !subscription_items_contain_mailbox(&items, &runtime.source_mailbox) {
         // Always keep the configured source mailbox visible even if the static

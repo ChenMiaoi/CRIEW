@@ -43,19 +43,26 @@ filter = "info"
 # When `imap.user` is omitted, CRIEW also uses this as the IMAP login identity.
 # email = "you@example.com"
 
-# Optional but required for `Following` / real IMAP sync.
+# For Gmail, setting sendemail.smtpServer=smtp.gmail.com in ~/.gitconfig is
+# enough to select IMAP defaults. CRIEW reuses sendemail.smtpUser/smtpPass;
+# explicit values below override those defaults.
+# Optional but required for real IMAP sync.
 # Supports legacy aliases: imapuser / imappass / imapserver / imapserverport / imapencryption
-# `user` is the IMAP login account. Gmail usually expects the full email address here.
-# If omitted, CRIEW falls back to `imap.email`.
-# user = "you@example.com"
-# pass = "imap-pass"
-# server = "imap.example.com"
+# `user` is the IMAP login account; it defaults to the configured email.
+# email = "you@gmail.com"
+# user = "you@gmail.com"
+# pass = "app-password"
+# server = "imap.gmail.com"
 # serverport = 993
-# encryption = "ssl" # Gmail IMAP 993 implicit TLS/SSL; "tls" is accepted as the same mode
+# encryption = "ssl"
 # proxy = "socks5://10.0.2.2:7890" # Optional. Supports http://, socks5://, socks5h://
 # When omitted, CRIEW falls back to CRIEW_IMAP_PROXY, ALL_PROXY, HTTPS_PROXY, then HTTP_PROXY.
 
 [ui]
+
+# Optional. Default preview pane width is fixed at 85 columns. Set true to
+# enable resizing the preview pane with [ ] and { }.
+# allow_preview_resize = true
 # Optional. Whether to auto-sync enabled subscriptions after TUI starts.
 # Default: true
 # startup_sync = true

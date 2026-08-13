@@ -759,13 +759,13 @@ fn external_editor_session_restores_terminal_after_editor_exit() {
 }
 
 #[test]
-fn mail_page_layout_keeps_preview_at_fixed_90_columns() {
+fn mail_page_layout_keeps_preview_at_fixed_85_columns() {
     let panes = mail_page_panes(Rect::new(0, 0, 180, 20), MailPaneLayout::default());
 
-    assert_eq!(panes[2].width, 90);
-    assert_eq!(panes[2].x, 90);
+    assert_eq!(panes[2].width, 85);
+    assert_eq!(panes[2].x, 95);
     assert_eq!(panes[0].width, 23);
-    assert_eq!(panes[1].width, 67);
+    assert_eq!(panes[1].width, 72);
     assert_eq!(panes[0].width + panes[1].width + panes[2].width, 180);
 }
 
@@ -779,7 +779,7 @@ fn mail_page_layout_falls_back_to_available_width_when_terminal_is_narrow() {
 }
 
 #[test]
-fn mail_page_layout_uses_persisted_fixed_mail_pane_widths() {
+fn mail_page_layout_uses_persisted_fixed_mail_pane_widths_when_enabled() {
     let panes = mail_page_panes(
         Rect::new(0, 0, 180, 20),
         MailPaneLayout {
@@ -1519,6 +1519,8 @@ fn preview_focus_supports_minus_equals_shifted_equals_and_plus_thread_navigation
 fn resize_shortcuts_follow_the_focused_mail_pane_and_persist_layout() {
     let root = temp_dir("mail-pane-resize");
     let runtime = test_runtime_in(root.clone());
+    fs::write(&runtime.config_path, "[ui]\nallow_preview_resize = true\n")
+        .expect("write preview resize config");
     let mut state = AppState::new(vec![], runtime);
 
     let expand_subscriptions = handle_key_event(
@@ -1527,7 +1529,7 @@ fn resize_shortcuts_follow_the_focused_mail_pane_and_persist_layout() {
     );
     assert!(matches!(expand_subscriptions, LoopAction::Continue));
     assert_eq!(state.mail_pane_layout.subscriptions_width, 27);
-    assert_eq!(state.mail_pane_layout.preview_width, 90);
+    assert_eq!(state.mail_pane_layout.preview_width, 85);
 
     let shrink_subscriptions = handle_key_event(
         &mut state,
@@ -1556,14 +1558,14 @@ fn resize_shortcuts_follow_the_focused_mail_pane_and_persist_layout() {
         KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
     );
     assert!(matches!(expand_threads_right, LoopAction::Continue));
-    assert_eq!(state.mail_pane_layout.preview_width, 86);
+    assert_eq!(state.mail_pane_layout.preview_width, 81);
 
     let shrink_threads_right = handle_key_event(
         &mut state,
         KeyEvent::new(KeyCode::Char('}'), KeyModifiers::SHIFT),
     );
     assert!(matches!(shrink_threads_right, LoopAction::Continue));
-    assert_eq!(state.mail_pane_layout.preview_width, 90);
+    assert_eq!(state.mail_pane_layout.preview_width, 85);
 
     state.focus = Pane::Preview;
     let expand_preview = handle_key_event(
@@ -1571,20 +1573,20 @@ fn resize_shortcuts_follow_the_focused_mail_pane_and_persist_layout() {
         KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
     );
     assert!(matches!(expand_preview, LoopAction::Continue));
-    assert_eq!(state.mail_pane_layout.preview_width, 94);
+    assert_eq!(state.mail_pane_layout.preview_width, 89);
 
     let shrink_preview = handle_key_event(
         &mut state,
         KeyEvent::new(KeyCode::Char('{'), KeyModifiers::SHIFT),
     );
     assert!(matches!(shrink_preview, LoopAction::Continue));
-    assert_eq!(state.mail_pane_layout.preview_width, 90);
+    assert_eq!(state.mail_pane_layout.preview_width, 85);
 
     let persisted = ui_state::load(&state.ui_state_path)
         .expect("load persisted ui state")
         .expect("ui state exists");
     assert_eq!(persisted.mail_subscriptions_width, 23);
-    assert_eq!(persisted.mail_preview_width, 90);
+    assert_eq!(persisted.mail_preview_width, 85);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1623,7 +1625,10 @@ fn resize_shortcuts_stop_at_fixed_edges_and_minimum_mail_pane_widths() {
         KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
     );
     assert!(matches!(preview_fixed_edge_action, LoopAction::Continue));
-    assert_eq!(state.status, "mail pane cannot expand in that direction");
+    assert_eq!(
+        state.status,
+        "preview pane resizing is disabled (set ui.allow_preview_resize = true)"
+    );
 
     state.mail_pane_layout.preview_width = MIN_MAIL_PREVIEW_WIDTH;
 
@@ -1633,7 +1638,10 @@ fn resize_shortcuts_stop_at_fixed_edges_and_minimum_mail_pane_widths() {
     );
     assert!(matches!(min_preview_action, LoopAction::Continue));
     assert_eq!(state.mail_pane_layout.preview_width, MIN_MAIL_PREVIEW_WIDTH);
-    assert_eq!(state.status, "mail pane cannot shrink in that direction");
+    assert_eq!(
+        state.status,
+        "preview pane resizing is disabled (set ui.allow_preview_resize = true)"
+    );
 }
 
 #[test]
@@ -3549,6 +3557,25 @@ fn qemu_mailbox_case_variants_reuse_the_default_subscription() {
 }
 
 #[test]
+fn following_view_remains_visible_before_imap_configuration() {
+    let state = AppState::new(vec![], test_runtime());
+    let following = state
+        .subscriptions
+        .iter()
+        .find(|item| item.mailbox == IMAP_INBOX_MAILBOX)
+        .expect("My Mail subscription exists");
+
+    assert_eq!(following.label, MY_INBOX_LABEL);
+    assert!(!following.enabled);
+    assert!(
+        state
+            .subscription_rows()
+            .iter()
+            .any(|row| row.text.contains("My Mail"))
+    );
+}
+
+#[test]
 fn first_open_with_complete_imap_enables_my_inbox() {
     let state = AppState::new(vec![], test_runtime_with_imap());
     let my_inbox = state
@@ -3575,11 +3602,11 @@ fn app_state_restores_and_re_persists_mail_pane_layout_from_ui_state() {
     );
 
     assert_eq!(state.mail_pane_layout.subscriptions_width, 29);
-    assert_eq!(state.mail_pane_layout.preview_width, 82);
+    assert_eq!(state.mail_pane_layout.preview_width, 85);
 
     let persisted = state.to_ui_state();
     assert_eq!(persisted.mail_subscriptions_width, 29);
-    assert_eq!(persisted.mail_preview_width, 82);
+    assert_eq!(persisted.mail_preview_width, 85);
 }
 
 #[test]

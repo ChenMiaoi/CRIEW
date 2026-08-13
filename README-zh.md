@@ -37,11 +37,10 @@ criew outbox
 criew tui
 ```
 
-配置好 IMAP 后，TUI 会用虚拟视图 `Following（关注）` 替代单独的个人收件箱订阅。
-它使用配置的自身邮箱地址检索邮件头：发给你的邮件（`To`）、抄送给你的邮件（`Cc`），
-以及你发送的 patch，会按 thread 形成额外的更新记录，并显示 `TO`、`CC`、`SENT`
-标记。CRIEW 实际检索并同步 IMAP `INBOX`，但 `INBOX` 只是内部数据源，不会再作为第二个
-可见订阅出现。
+配置好 IMAP 后，TUI 会显示虚拟视图 `My Mail（我的邮件）`，不再要求单独配置个人收件箱订阅。
+它包含发给你的邮件（`To`）、抄送给你的邮件（`Cc`）以及你发送的 patch（`From`），
+并显示 `TO`、`CC`、`SENT` 标记。CRIEW 实际检索并同步 IMAP `INBOX`，但 `INBOX`
+只是内部数据源，不会作为第二个可见订阅出现。
 
 如果增量同步只拿到了一部分对话，可以对其中任意一封邮件的
 `Message-ID` 运行 `fetch-thread`。命令会沿着 `References`/`In-Reply-To`

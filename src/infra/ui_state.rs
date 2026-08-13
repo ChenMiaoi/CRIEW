@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 
 pub const DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH: u16 = 23;
-pub const DEFAULT_MAIL_PREVIEW_WIDTH: u16 = 90;
+pub const DEFAULT_MAIL_PREVIEW_WIDTH: u16 = 85;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SavedView {

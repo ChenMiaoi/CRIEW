@@ -677,6 +677,20 @@ fn select_initial_inbox_messages(
 ) -> InitialInboxSelection {
     let scanned = remote_messages.len();
     let mut envelopes = parse_remote_messages(mailbox, remote_messages);
+    let message_ids: HashSet<String> = envelopes
+        .iter()
+        .map(|envelope| envelope.parsed.message_id.clone())
+        .collect();
+    // A reply whose referenced root is outside the candidate set is not a
+    // complete thread. Do not spend one of the initial 20 slots on it.
+    envelopes.retain(|envelope| {
+        envelope.parsed.references.is_empty()
+            || envelope
+                .parsed
+                .references
+                .iter()
+                .any(|reference| message_ids.contains(reference))
+    });
     envelopes.retain(|envelope| patch_worker::subject_is_patch_related(&envelope.parsed.subject));
     let patch_related = envelopes.len();
     let selected = retain_latest_threads(envelopes, thread_limit);
@@ -1315,6 +1329,7 @@ mod tests {
             ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+
             kernel_trees: Vec::new(),
         };
 
@@ -1330,5 +1345,25 @@ mod tests {
         .expect("resolve source");
 
         assert!(matches!(source, SyncSource::GnuArchive));
+    }
+
+    #[test]
+    fn initial_selection_excludes_reply_without_root_candidate() {
+        let messages = vec![
+            RemoteMail {
+                uid: 1,
+                modseq: None,
+                flags: Vec::new(),
+                raw: b"Message-ID: <reply@example.com>\nSubject: Re: [PATCH] missing\nReferences: <root@example.com>\n\n".to_vec(),
+            },
+            RemoteMail {
+                uid: 2,
+                modseq: None,
+                flags: Vec::new(),
+                raw: b"Message-ID: <root2@example.com>\nSubject: [PATCH] complete\n\n".to_vec(),
+            },
+        ];
+        let selection = select_initial_inbox_messages("list", messages, 20);
+        assert_eq!(selection.selected_uids, vec![2]);
     }
 }
